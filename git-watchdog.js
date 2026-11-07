@@ -1,13 +1,13 @@
 const { execFileSync } = require('child_process');
-const path = require('path');
 
 const repositoryPath = __dirname;
 const remoteName = process.env.GIT_REMOTE || 'origin';
 const branchName = process.env.GIT_BRANCH || 'main';
 const intervalMs = Number(process.env.GIT_PULL_INTERVAL_MS || 60_000);
+const maximumBackoffMs = 30 * 60_000;
 
-if (!Number.isSafeInteger(intervalMs) || intervalMs < 10_000) {
-  throw new Error('GIT_PULL_INTERVAL_MS must be an integer of at least 10000 milliseconds.');
+if (!Number.isSafeInteger(intervalMs) || intervalMs < 60_000) {
+  throw new Error('GIT_PULL_INTERVAL_MS must be an integer of at least 60000 milliseconds.');
 }
 
 function runGit(args) {
@@ -20,42 +20,82 @@ function runGit(args) {
 }
 
 let isChecking = false;
+let timer;
+let consecutiveFailures = 0;
+let lastError = null;
+let wasDirty = false;
+let branchMismatch = false;
 
-async function checkForUpdates() {
-  if (isChecking) return;
+function scheduleNextCheck(delay) {
+  timer = setTimeout(checkForUpdates, delay);
+}
+
+function checkForUpdates() {
+  if (isChecking) {
+    scheduleNextCheck(intervalMs);
+    return;
+  }
   isChecking = true;
 
   try {
     const currentBranch = runGit(['branch', '--show-current']);
     if (currentBranch !== branchName) {
-      console.warn(`[git-watchdog] Skipping pull: checked out branch is "${currentBranch || '(detached)'}", expected "${branchName}".`);
+      if (!branchMismatch) {
+        console.warn(`[git-watchdog] Paused: checked out branch is "${currentBranch || '(detached)'}", expected "${branchName}".`);
+      }
+      branchMismatch = true;
       return;
+    }
+    if (branchMismatch) {
+      console.log(`[git-watchdog] Resumed monitoring branch "${branchName}".`);
+      branchMismatch = false;
     }
 
     const changes = runGit(['status', '--porcelain', '--untracked-files=normal']);
     if (changes) {
-      console.warn('[git-watchdog] Skipping pull because local changes are present.');
+      if (!wasDirty) {
+        console.warn('[git-watchdog] Paused pulls while local changes are present.');
+      }
+      wasDirty = true;
       return;
     }
+    if (wasDirty) {
+      console.log('[git-watchdog] Local changes are clear; pull checks resumed.');
+      wasDirty = false;
+    }
 
-    const result = runGit(['pull', '--ff-only', remoteName, branchName]);
-    console.log(`[git-watchdog] ${result || 'Repository is up to date.'}`);
+    const previousCommit = runGit(['rev-parse', 'HEAD']);
+    runGit(['pull', '--quiet', '--ff-only', remoteName, branchName]);
+    const currentCommit = runGit(['rev-parse', 'HEAD']);
+    if (currentCommit !== previousCommit) {
+      console.log(`[git-watchdog] Updated to ${currentCommit.slice(0, 12)}.`);
+    }
+
+    consecutiveFailures = 0;
+    if (lastError) {
+      console.log('[git-watchdog] Pull checks recovered.');
+      lastError = null;
+    }
   } catch (error) {
     const details = error.stderr?.toString().trim() || error.message;
-    console.error(`[git-watchdog] Pull check failed: ${details}`);
+    consecutiveFailures++;
+    if (details !== lastError) {
+      console.error(`[git-watchdog] Pull check failed: ${details}`);
+      lastError = details;
+    }
   } finally {
     isChecking = false;
+    const backoff = Math.min(intervalMs * (2 ** Math.min(consecutiveFailures, 10)), maximumBackoffMs);
+    scheduleNextCheck(backoff);
   }
 }
 
-const gitDirectory = path.join(repositoryPath, '.git');
-console.log(`[git-watchdog] Monitoring ${branchName} from ${remoteName} every ${intervalMs / 1000}s (${gitDirectory}).`);
+console.log(`[git-watchdog] Monitoring ${branchName} from ${remoteName}; checks are quiet unless the repository changes or needs attention.`);
 checkForUpdates();
-const timer = setInterval(checkForUpdates, intervalMs);
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
-    clearInterval(timer);
+    clearTimeout(timer);
     process.exit(0);
   });
 }
