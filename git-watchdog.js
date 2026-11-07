@@ -38,6 +38,27 @@ function scheduleNextCheck(delay) {
   timer = setTimeout(checkForUpdates, delay);
 }
 
+function tryInitializeGitRepo() {
+  const remoteUrl = process.env.GIT_REPO_URL || process.env.GIT_REMOTE_URL || 'https://github.com/nithishkumar717/controbot.git';
+  try {
+    console.log(`[git-watchdog] Missing .git folder; initializing repository linked to "${remoteName}/${branchName}"...`);
+    runGit(['init']);
+    try {
+      runGit(['remote', 'add', remoteName, remoteUrl]);
+    } catch {
+      runGit(['remote', 'set-url', remoteName, remoteUrl]);
+    }
+    runGit(['fetch', '--quiet', remoteName, branchName]);
+    runGit(['branch', '-M', branchName]);
+    runGit(['reset', '--mixed', `${remoteName}/${branchName}`]);
+    console.log(`[git-watchdog] Repository successfully initialized and linked to "${remoteName}/${branchName}".`);
+    return true;
+  } catch (err) {
+    console.warn(`[git-watchdog] Auto-initialization note: ${err.message}`);
+    return false;
+  }
+}
+
 function checkForUpdates() {
   if (isChecking) {
     scheduleNextCheck(intervalMs);
@@ -45,8 +66,11 @@ function checkForUpdates() {
   }
 
   if (!isGitRepo()) {
-    console.warn('[git-watchdog] No .git directory found; auto-pull disabled.');
-    return;
+    const initialized = tryInitializeGitRepo();
+    if (!initialized) {
+      console.warn('[git-watchdog] No .git directory found; auto-pull disabled.');
+      return;
+    }
   }
 
   isChecking = true;
@@ -130,7 +154,10 @@ function checkForUpdates() {
 
 function manualPull() {
   if (!isGitRepo()) {
-    return { success: false, message: 'No git repository detected.' };
+    const initialized = tryInitializeGitRepo();
+    if (!initialized) {
+      return { success: false, message: 'No git repository detected and auto-initialization failed.' };
+    }
   }
 
   try {
