@@ -75,52 +75,52 @@ module.exports = {
     {
       token: process.env.BOT_TOKEN_11,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_12,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_13,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_14,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_15,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_16,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_17,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_18,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_19,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_20,
       guildId: '1292783081811349525',
-      channelId: '1520418162917511241'
+      channelId: '1532017782042919054'
     },
     {
       token: process.env.BOT_TOKEN_21,

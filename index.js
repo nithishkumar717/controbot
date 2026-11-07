@@ -2211,6 +2211,8 @@ for (const bot of config.bots) {
       }
 
       const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
+      if (!isPrimaryInGuild) return;
+
       const newNick = args.slice(1).join(' ').trim();
       const isReset = !newNick || newNick.toLowerCase() === 'reset';
 
@@ -2262,19 +2264,19 @@ for (const bot of config.bots) {
         return message.reply('You do not have permission to change this server profile.');
       }
 
+      // Strictly execute ONLY on the bot designated for this server
       const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
+      if (!isPrimaryInGuild) return;
 
       let subArg = (args[1] || 'all').toLowerCase();
       if (subArg === 'icon' || subArg === 'pfp') subArg = 'avatar';
       if (subArg === 'name') subArg = 'nick';
 
       if (!['all', 'avatar', 'nick', 'banner'].includes(subArg)) {
-        if (!isPrimaryInGuild) return;
         return message.reply('Usage: `!mimic [icon|nick|all]`');
       }
 
       if (subArg === 'banner') {
-        if (!isPrimaryInGuild) return;
         return message.reply('Discord does not support banners for bot accounts via the API. Use `!mimic icon` to copy the server icon, or `!mimic nick` to copy the server name.');
       }
 
@@ -2282,7 +2284,7 @@ for (const bot of config.bots) {
         const guild = await message.guild.fetch();
         const actionsPerformed = [];
 
-        // 1. Copy Server Name to Nickname
+        // 1. Copy Server Name to Nickname (only for this server's bot)
         if (subArg === 'nick' || subArg === 'all') {
           const serverNameNick = guild.name.slice(0, 32);
           try {
@@ -2293,7 +2295,7 @@ for (const bot of config.bots) {
           }
         }
 
-        // 2. Copy Server Icon to Avatar
+        // 2. Copy Server Icon to Avatar (only for this server's bot)
         if (subArg === 'avatar' || subArg === 'all') {
           const iconUrl = guild.iconURL({
             extension: 'png',
@@ -2303,7 +2305,6 @@ for (const bot of config.bots) {
 
           if (!iconUrl) {
             if (actionsPerformed.length === 0) {
-              if (!isPrimaryInGuild) return;
               return message.reply('This server does not have an icon to copy.');
             }
           } else {
@@ -2313,42 +2314,27 @@ for (const bot of config.bots) {
             }
             const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
 
-            if (isPrimaryInGuild) {
-              try {
-                await client.user.setAvatar(imageBytes);
-                actionsPerformed.push("server icon to bot avatar");
-              } catch (avatarErr) {
-                if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
-                  actionsPerformed.push("(avatar change rate-limited by Discord; try again in a few minutes)");
-                } else {
-                  console.warn(`[${client.user.tag}] setAvatar error:`, avatarErr.message);
-                }
+            try {
+              await client.user.setAvatar(imageBytes);
+              actionsPerformed.push("server icon to bot avatar");
+            } catch (avatarErr) {
+              if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
+                actionsPerformed.push("(avatar change rate-limited by Discord; try again in a few minutes)");
+              } else {
+                console.warn(`[${client.user.tag}] setAvatar error:`, avatarErr.message);
               }
-            } else {
-              const guildBotPos = botsInGuild.findIndex(b => b.index === currentActiveIndex);
-              setTimeout(async () => {
-                try {
-                  await client.user.setAvatar(imageBytes);
-                } catch {}
-              }, Math.max(1, guildBotPos) * 1500);
             }
           }
         }
 
-        if (isPrimaryInGuild) {
-          if (actionsPerformed.length > 0) {
-            return message.reply(`Updated ${actionsPerformed.join(' and ')}.`);
-          } else {
-            return message.reply('No server profile changes could be applied.');
-          }
+        if (actionsPerformed.length > 0) {
+          return message.reply(`Updated ${actionsPerformed.join(' and ')} for **${client.user.tag}** in this server.`);
+        } else {
+          return message.reply('No server profile changes could be applied.');
         }
-        return;
       } catch (err) {
-        if (isPrimaryInGuild) {
-          console.error('Failed to mimic server artwork:', err.message);
-          return message.reply(`Could not mimic server artwork: ${err.message}`);
-        }
-        return;
+        console.error('Failed to mimic server artwork:', err.message);
+        return message.reply(`Could not mimic server artwork: ${err.message}`);
       }
     }
 
@@ -2363,6 +2349,8 @@ for (const bot of config.bots) {
       }
 
       const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
+      if (!isPrimaryInGuild) return;
+
       const profileAsset = commandNameText.replace(/^!n?/, '');
 
       if (profileAsset === 'banner') {
