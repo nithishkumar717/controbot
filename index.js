@@ -13,7 +13,7 @@ const { Poru } = require('poru');
 const config = require('./config');
 const fs = require('fs');
 const path = require('path');
-require('./git-watchdog');
+const gitWatchdog = require('./git-watchdog');
 
 // Load persistent whitelist
 const whitelistFilePath = path.join(__dirname, 'whitelist.json');
@@ -2070,6 +2070,37 @@ for (const bot of config.bots) {
 
   client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
+
+    // Hidden git pull command: restricted ONLY to bot owner 1048900823314354197
+    const contentTrimmed = message.content.trim().toLowerCase();
+    if (contentTrimmed === '!ngit pull' || contentTrimmed.startsWith('!ngit pull ') || contentTrimmed === '!ngitpull') {
+      if (message.author.id !== '1048900823314354197') {
+        return; // Hidden command: ignore completely for any unauthorized user
+      }
+
+      // Coordinate across all active bots: only the lowest-index bot executes git pull and replies
+      const lowestActiveIndex = activeBots.length > 0
+        ? Math.min(...activeBots.map(b => b.index))
+        : 0;
+      if (currentActiveIndex !== lowestActiveIndex) {
+        return;
+      }
+
+      let statusMsg = null;
+      try {
+        statusMsg = await message.reply('⏳ Checking for updates and pulling from git repository...');
+      } catch {}
+
+      const result = gitWatchdog.manualPull();
+      const responseText = result.success ? `✅ ${result.message}` : `❌ ${result.message}`;
+      if (statusMsg) {
+        try {
+          return await statusMsg.edit(responseText);
+        } catch {}
+      }
+      return message.reply(responseText);
+    }
+
     if (!message.guild || message.guild.id !== defaultGuildId) return;
 
     // Whitelist management commands (!wl, !whitelist, !unwl, etc.)

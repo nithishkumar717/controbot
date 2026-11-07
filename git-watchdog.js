@@ -128,6 +128,63 @@ function checkForUpdates() {
   }
 }
 
+function manualPull() {
+  if (!isGitRepo()) {
+    return { success: false, message: 'No git repository detected.' };
+  }
+
+  try {
+    // 1. Fetch latest commits
+    runGit(['fetch', '--quiet', remoteName, branchName]);
+
+    const localCommit = runGit(['rev-parse', 'HEAD']);
+    const remoteCommit = runGit(['rev-parse', `${remoteName}/${branchName}`]);
+
+    if (localCommit === remoteCommit) {
+      return {
+        success: true,
+        updated: false,
+        message: `Already up to date on branch \`${branchName}\` (\`${localCommit.slice(0, 7)}\`).`
+      };
+    }
+
+    // 2. Check for dirty tracked files
+    const dirtyTracked = runGit(['status', '--porcelain', '-uno']);
+    if (dirtyTracked) {
+      return {
+        success: false,
+        message: 'Cannot pull: local modifications exist on tracked files.'
+      };
+    }
+
+    // 3. Fast-forward pull
+    runGit(['pull', '--quiet', '--ff-only', remoteName, branchName]);
+    const updatedCommit = runGit(['rev-parse', 'HEAD']);
+
+    console.log(`[git-watchdog] Manual pull completed: ${localCommit.slice(0, 7)} -> ${updatedCommit.slice(0, 7)}. Restarting process...`);
+
+    // 4. Restart process so updated code is loaded
+    if (autoRestart) {
+      setTimeout(() => {
+        process.exit(0);
+      }, 1500);
+    }
+
+    return {
+      success: true,
+      updated: true,
+      message: `Successfully pulled updates (\`${localCommit.slice(0, 7)}\` ➔ \`${updatedCommit.slice(0, 7)}\`). Restarting bot...`
+    };
+  } catch (error) {
+    const details = error.stderr?.toString().trim() || error.message;
+    console.error(`[git-watchdog] Manual pull error: ${details}`);
+    return {
+      success: false,
+      message: `Git pull failed: ${details}`
+    };
+  }
+}
+
 function start() {
   if (timer) return; // Already started
   console.log(`[git-watchdog] Active: Monitoring "${branchName}" from "${remoteName}" every ${Math.round(intervalMs / 1000)}s.`);
@@ -146,5 +203,6 @@ start();
 
 module.exports = {
   start,
-  checkForUpdates
+  checkForUpdates,
+  manualPull
 };
