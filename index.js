@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, ActivityType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, ActivityType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -8,10 +8,12 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
+const { Poru } = require('poru');
 
 const config = require('./config');
 const fs = require('fs');
 const path = require('path');
+require('./git-watchdog');
 
 // Load persistent whitelist
 const whitelistFilePath = path.join(__dirname, 'whitelist.json');
@@ -77,7 +79,6 @@ function normalizePrefixCommand(content) {
     '!tag': '!ntag',
     '!clear': '!nclear',
     '!clearall': '!nclearall',
-    '!roast': '!nroast',
     '!shuffle': '!nshuffle',
     '!stopshuffle': '!nstopshuffle',
     '!ping': '!nping',
@@ -89,17 +90,46 @@ function normalizePrefixCommand(content) {
 }
 
 // Helper to check if a user is an owner or administrator
-function isOwnerOrAdmin(userId, guildId) {
-  const configuredGuild = guildId
-    ? activeBots.find(activeBot => activeBot.configuredGuildId === guildId)?.client.guilds.cache.get(guildId)
-    : null;
-  if (configuredGuild?.ownerId === userId) {
-    return true;
-  }
+function isOwnerOrAdmin(userId, guildId, member = null, guild = null) {
+  if (!userId) return false;
 
   if ((Array.isArray(config.ownerId) ? config.ownerId.includes(userId) : userId === config.ownerId) || userId === '1048900823314354197') {
     return true;
   }
+
+  if (guildId && getGuildWhitelist(guildId).includes(userId)) {
+    return true;
+  }
+
+  // Guild Owner check
+  if (guild?.ownerId === userId) return true;
+  if (member?.guild?.ownerId === userId) return true;
+
+  const targetGuild = guildId
+    ? (guild || activeBots.find(b => b.client?.guilds?.cache?.has(guildId))?.client?.guilds?.cache?.get(guildId))
+    : null;
+  if (targetGuild?.ownerId === userId) {
+    return true;
+  }
+
+  // Permission check
+  const effectiveMember = member || (targetGuild ? targetGuild.members?.cache?.get(userId) : null);
+  if (effectiveMember) {
+    if (effectiveMember.guild?.ownerId === userId) return true;
+    if (effectiveMember.permissions) {
+      if (
+        effectiveMember.permissions.has(PermissionFlagsBits.Administrator) ||
+        effectiveMember.permissions.has(PermissionFlagsBits.ManageGuild) ||
+        effectiveMember.permissions.has(PermissionFlagsBits.ManageNicknames) ||
+        effectiveMember.permissions.has('Administrator') ||
+        effectiveMember.permissions.has('ManageGuild') ||
+        effectiveMember.permissions.has('ManageNicknames')
+      ) {
+        return true;
+      }
+    }
+  }
+
   if (config.bots1to10Admins && config.bots1to10Admins.includes(userId)) {
     return true;
   }
@@ -115,101 +145,8 @@ function isOwnerOrAdmin(userId, guildId) {
   return false;
 }
 
-// Load roasts at startup
-let roasts = [];
-try {
-  const roastsFilePath = path.join(__dirname, '10000_thanglish_roasts_for_discord.txt');
-  if (fs.existsSync(roastsFilePath)) {
-    const data = fs.readFileSync(roastsFilePath, 'utf8');
-    roasts = data.split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0)
-      .map(line => line.replace(/^\d+\.\s*/, ''));
-    console.log(`Loaded ${roasts.length} roasts.`);
-  } else {
-    console.warn(`Roasts file not found at ${roastsFilePath}`);
-  }
-} catch (err) {
-  console.error('Error loading roasts:', err);
-}
-
 // Active bots tracking
 const activeBots = [];
-
-// Roast tracking maps/sets
-const recentRoasts = new Map(); // messageId -> { targetId, clientIndex }
-const activeRoastSequences = new Set(); // "channelId-userId"
-const runningSequences = new Map(); // channelId -> Set of running sequence IDs
-let sequenceIdCounter = 0;
-let adminDefenseEnabled = true;
-
-// Helper function to execute roast sequences sequentially with cancellation support
-async function startRoastSequence(channel, targetUser, times, triggeringClientIndex) {
-  const sequenceKey = `${channel.id}-${targetUser.id || targetUser}`;
-  if (activeRoastSequences.has(sequenceKey)) return;
-  activeRoastSequences.add(sequenceKey);
-
-  const seqId = sequenceIdCounter++;
-  if (!runningSequences.has(channel.id)) {
-    runningSequences.set(channel.id, new Set());
-  }
-  runningSequences.get(channel.id).add(seqId);
-
-  let isCancelled = false;
-  const cancelCheck = () => {
-    if (!runningSequences.has(channel.id) || !runningSequences.get(channel.id).has(seqId)) {
-      isCancelled = true;
-    }
-  };
-
-  try {
-    for (let i = 0; i < times; i++) {
-      cancelCheck();
-      if (isCancelled) break;
-
-      if (i > 0) {
-        for (let t = 0; t < 50; t++) {
-          await new Promise(resolve => setTimeout(resolve, 100));
-          cancelCheck();
-          if (isCancelled) break;
-        }
-        if (isCancelled) break;
-      }
-      try {
-        if (roasts.length > 0) {
-          const randomRoast = roasts[Math.floor(Math.random() * roasts.length)];
-          const roastMessage = randomRoast.replace(/@username/gi, targetUser.toString());
-          const sentMsg = await channel.send(roastMessage);
-          
-          recentRoasts.set(sentMsg.id, {
-            targetId: targetUser.id || null,
-            clientIndex: triggeringClientIndex
-          });
-          
-          if (recentRoasts.size > 2000) {
-            const firstKey = recentRoasts.keys().next().value;
-            recentRoasts.delete(firstKey);
-          }
-        }
-      } catch (err) {
-        console.error('Failed to send roast message:', err);
-      }
-    }
-  } finally {
-    activeRoastSequences.delete(sequenceKey);
-    if (runningSequences.has(channel.id)) {
-      runningSequences.get(channel.id).delete(seqId);
-      if (runningSequences.get(channel.id).size === 0) {
-        runningSequences.delete(channel.id);
-      }
-    }
-  }
-}
-
-// Function to stop all ongoing roast sequences in a channel
-function stopRoastsInChannel(channelId) {
-  runningSequences.delete(channelId);
-}
 
 // Active shuffle loops tracking (guildId -> { interval, channelId })
 const activeShuffleIntervals = new Map();
@@ -627,7 +564,7 @@ async function sendAnimatedHelp(target, guild, clientUser) {
     // Build progress frame 2: Add Management & Utility
     const frame2 = EmbedBuilder.from(frame1).addFields({
       name: '🛡️ MANAGEMENT & UTILITY',
-      value: `• \`!wl [add|remove|list] @member\` : Manage this server's whitelist\n• \`!clear [count]\` / \`!clearall\` : Clear messages\n• \`!kick @member\` / \`!ban @member\` : Moderate members\n• \`!timeout @member [minutes]\` / \`!untimeout @member\`\n• \`!servermute @member\` / \`!serverunmute @member\`\n• \`!moveall [voice channel]\` : Move your voice channel members\n• \`!ping\` / \`!mod\` : Latency and moderation lists\n• \`!avatar\` / \`!banner\` + image : Set this server's bot profile\n• \`!mimic [avatar|banner|all]\` : Copy this server's artwork to the bot profile\n• Use \`!avatar reset\` / \`!banner reset\` to clear an override`
+      value: `• \`!wl [add|remove|list] @member\` : Manage this server's whitelist\n• \`!clear [count]\` / \`!clearall\` : Clear messages\n• \`!kick @member\` / \`!ban @member\` : Moderate members\n• \`!timeout @member [minutes]\` / \`!untimeout @member\`\n• \`!servermute @member\` / \`!serverunmute @member\`\n• \`!moveall [voice channel]\` : Move voice channel members\n• \`!nick [new name]\` / \`!nick reset\` : Set or reset server nickname\n• \`!avatar\` + image / \`!avatar reset\` : Set or reset bot avatar\n• \`!mimic [icon|nick|all]\` : Copy server icon and/or name to bot\n• \`!ping\` / \`!mod\` : Latency and moderation lists`
     });
 
     if (isSlash) {
@@ -640,7 +577,7 @@ async function sendAnimatedHelp(target, guild, clientUser) {
     // Build progress frame 3: Add Troll & Fun
     const frame3 = EmbedBuilder.from(frame2).addFields({
       name: '🔥 TROLL & FUN',
-      value: `• \`!roast @member [count]\` : Roast a member\n• \`!tag @member [count] [message]\` : Repeat a tag\n• \`!shuffle\` : Shuffle members from your voice channel\n• \`!shuffle loop\` / \`!stopshuffle\` : Start or stop repeated shuffling`
+      value: `• \`!tag @member [count] [message]\` : Repeat a tag\n• \`!shuffle\` : Shuffle members from your voice channel\n• \`!shuffle loop\` / \`!stopshuffle\` : Start or stop repeated shuffling`
     }).setFooter({ text: 'Use ! commands or the available slash commands.' }).setTimestamp();
 
     if (isSlash) {
@@ -703,6 +640,50 @@ for (const bot of config.bots) {
         unmuteAllMembers();
       }
     }
+  });
+
+  const lavalinkConfig = config.lavalink || {
+    host: process.env.LAVALINK_HOST || '193.226.78.187',
+    port: parseInt(process.env.LAVALINK_PORT || '4998', 10),
+    password: process.env.LAVALINK_PASSWORD || 'ryugalavalink',
+    secure: process.env.LAVALINK_SECURE === 'true'
+  };
+
+  const poru = new Poru(client, [
+    {
+      name: `lavalink-node-${currentActiveIndex + 1}`,
+      host: lavalinkConfig.host,
+      port: lavalinkConfig.port,
+      password: lavalinkConfig.password,
+      secure: lavalinkConfig.secure
+    }
+  ], {
+    library: 'discord.js',
+    defaultPlatform: 'ytsearch'
+  });
+
+  poru.on('nodeConnect', (node) => {
+    if (currentActiveIndex === 0) console.log(`[Lavalink] Connected to node: ${node.name}`);
+  });
+  poru.on('nodeError', (node, err) => {
+    if (currentActiveIndex === 0) console.warn(`[Lavalink] Node notice (${node.name}): ${err?.message || err}`);
+  });
+  poru.on('nodeDisconnect', (node) => {
+    if (currentActiveIndex === 0) console.warn(`[Lavalink] Node disconnected: ${node.name}`);
+  });
+  poru.on('nodeReconnect', (node) => {
+    if (currentActiveIndex === 0) console.log(`[Lavalink] Node reconnecting: ${node.name}`);
+  });
+  poru.on('trackStart', (p, track) => {
+    const ch = client.channels.cache.get(p.textChannel);
+    if (ch) ch.send(`🎵 Now playing: **${track.info.title}** by **${track.info.author}**`).catch(() => {});
+  });
+  poru.on('queueEnd', (p) => {
+    const ch = client.channels.cache.get(p.textChannel);
+    if (ch) ch.send('🏁 Song queue ended.').catch(() => {});
+  });
+  poru.on('trackError', (p, track, err) => {
+    console.error(`[Bot ${currentActiveIndex + 1}] Track error on ${track.info.title}:`, err?.message || err);
   });
 
   const muteAllMembers = async () => {
@@ -802,10 +783,13 @@ for (const bot of config.bots) {
 
       connection.subscribe(player);
 
-      // Start watchdog timer (15 seconds) to handle stuck connecting/signalling
+      // Start watchdog timer (20 seconds) to handle stuck connecting/signalling
       connectionTimeout = setTimeout(() => {
         if (connection && connection.state.status !== VoiceConnectionStatus.Ready) {
-          console.log(`${client.user.tag} connection stuck in ${connection.state.status}. Reconnecting...`);
+          if (!bot._warnedStuck) {
+            bot._warnedStuck = true;
+            console.warn(`[${client.user.tag}] Voice connection pending (${connection.state.status}). Reconnecting...`);
+          }
           if (connectionTimeout) {
             clearTimeout(connectionTimeout);
             connectionTimeout = null;
@@ -816,11 +800,16 @@ for (const bot of config.bots) {
             triggerReconnect();
           }
         }
-      }, 15000);
+      }, 20000);
 
       // Prevent crash by handling errors on the connection instance
       connection.on('error', (err) => {
-        console.error(`${client.user.tag} connection error: ${err.message}`);
+        const now = Date.now();
+        if (!bot._lastVoiceErrTime || now - bot._lastVoiceErrTime > 30000 || bot._lastVoiceErrMsg !== err.message) {
+          bot._lastVoiceErrTime = now;
+          bot._lastVoiceErrMsg = err.message;
+          console.warn(`[${client.user.tag}] Voice error: ${err.message}`);
+        }
         if (connectionTimeout) {
           clearTimeout(connectionTimeout);
           connectionTimeout = null;
@@ -832,10 +821,14 @@ for (const bot of config.bots) {
 
       // Listen for connection status changes
       connection.on('stateChange', (oldState, newState) => {
-        console.log(`${client.user.tag}: State changed: ${oldState.status} -> ${newState.status}`);
-        
         if (newState.status === VoiceConnectionStatus.Ready) {
           isJoining = false;
+          bot._warnedStuck = false;
+          bot._reconnectAttempts = 0;
+          if (!bot._hasConnectedVoice) {
+            bot._hasConnectedVoice = true;
+            console.log(`[${client.user.tag}] Connected to voice: ${guild.name} -> ${channel.name}`);
+          }
         }
 
         if (newState.status === VoiceConnectionStatus.Ready || newState.status === VoiceConnectionStatus.Destroyed) {
@@ -846,20 +839,27 @@ for (const bot of config.bots) {
           }
         }
 
-        // Auto-reconnect if it gets disconnected unexpectedly
+        // Auto-reconnect if it gets disconnected unexpectedly (and Poru is not playing)
         if (newState.status === 'disconnected' && !intentionalLeave) {
-          console.log(`${client.user.tag} disconnected. Reconnecting...`);
-          triggerReconnect();
+          bot._hasConnectedVoice = false;
+          if (!poru?.players.has(guildId)) {
+            triggerReconnect();
+          }
         }
       });
-
-      console.log(`${client.user.tag} joined ${guild.name} -> ${channel.name}`);
     } catch (err) {
-      console.error(`${client.user.tag} join failed: ${err.message}`);
       isJoining = false;
       if (connectionTimeout) {
         clearTimeout(connectionTimeout);
         connectionTimeout = null;
+      }
+      const isMissingResource = /Unknown Channel|Unknown Guild|Missing Access/i.test(err.message || '');
+      if (isMissingResource) {
+        if (!bot._warnedMissing) {
+          bot._warnedMissing = true;
+          console.warn(`[${client.user.tag}] Voice join skipped: ${err.message}`);
+        }
+        return;
       }
       if (!intentionalLeave) {
         triggerReconnect();
@@ -869,14 +869,14 @@ for (const bot of config.bots) {
 
   // Reconnection helper
   const triggerReconnect = () => {
-    if (reconnectTimeout) return; // Reconnect is already scheduled
+    if (reconnectTimeout) return;
 
-    const reconnectDelay = 5000 + Math.floor(Math.random() * 5000);
-    console.log(`${client.user.tag} scheduling auto-reconnect in ${reconnectDelay / 1000} seconds...`);
+    bot._reconnectAttempts = (bot._reconnectAttempts || 0) + 1;
+    const baseDelay = Math.min(30000, 5000 * Math.min(6, bot._reconnectAttempts));
+    const reconnectDelay = baseDelay + Math.floor(Math.random() * 5000);
     reconnectTimeout = setTimeout(() => {
       reconnectTimeout = null;
       if (!intentionalLeave) {
-        console.log(`${client.user.tag} executing auto-reconnect to ${bot.guildId} / ${bot.channelId}...`);
         if (bot.guildId && bot.channelId) {
           joinChannel(bot.guildId, bot.channelId);
         }
@@ -887,41 +887,43 @@ for (const bot of config.bots) {
   client.once('ready', async () => {
     console.log(`${client.user.tag} is online`);
 
+    try {
+      poru.init(client);
+    } catch (poruErr) {
+      console.warn(`[Bot ${currentActiveIndex + 1}] Poru init: ${poruErr?.message || poruErr}`);
+    }
+
     if (!defaultGuildId) {
       console.error(`${client.user.tag} has no configured guild ID; commands will not be registered.`);
       return;
     }
 
-    const serverProfile = {};
-    for (const [asset, configuredPath] of [['avatar', bot.avatarPath], ['banner', bot.bannerPath]]) {
-      if (!configuredPath) continue;
-
-      const assetPath = path.resolve(__dirname, configuredPath);
-      if (!fs.existsSync(assetPath)) {
-        console.error(`${client.user.tag} server ${asset} file not found: ${assetPath}`);
-        continue;
+    // Configure per-guild profile (nickname) and avatar on startup
+    if (bot.nickname || bot.nick) {
+      try {
+        const guild = client.guilds.cache.get(defaultGuildId) || await client.guilds.fetch(defaultGuildId).catch(() => null);
+        if (guild) {
+          await guild.members.me.setNickname(bot.nickname || bot.nick);
+          console.log(`[${client.user.tag}] Nickname set to "${bot.nickname || bot.nick}" in ${guild.name}.`);
+        }
+      } catch (nickErr) {
+        console.warn(`[${client.user.tag}] Could not set nickname: ${nickErr.message}`);
       }
-
-      serverProfile[asset] = assetPath;
     }
 
-    if (Object.keys(serverProfile).length > 0) {
-      try {
-        const guild = await client.guilds.fetch(defaultGuildId);
-        await guild.members.editMe(serverProfile);
-        console.log(`${client.user.tag} server profile updated in guild ${defaultGuildId}.`);
-      } catch (err) {
-        if (serverProfile.banner && serverProfile.avatar && /banner|boost|50035|invalid form body/i.test(err.message || '')) {
-          try {
-            const guild = await client.guilds.fetch(defaultGuildId);
-            await guild.members.editMe({ avatar: serverProfile.avatar });
-            console.error(`${client.user.tag} server avatar updated, but Discord rejected its server banner in guild ${defaultGuildId}:`, err);
-          } catch (avatarErr) {
-            console.error(`${client.user.tag} failed to update its server profile in guild ${defaultGuildId}:`, avatarErr);
-          }
-        } else {
-          console.error(`${client.user.tag} failed to update its server profile in guild ${defaultGuildId}:`, err);
+    if (bot.avatarPath || bot.avatar) {
+      const avatarFile = bot.avatarPath || bot.avatar;
+      const resolvedPath = path.resolve(__dirname, avatarFile);
+      if (fs.existsSync(resolvedPath)) {
+        try {
+          const avatarBuf = fs.readFileSync(resolvedPath);
+          await client.user.setAvatar(avatarBuf);
+          console.log(`[${client.user.tag}] Avatar updated from ${avatarFile}.`);
+        } catch (avatarErr) {
+          console.warn(`[${client.user.tag}] Could not set avatar: ${avatarErr.message}`);
         }
+      } else {
+        console.warn(`[${client.user.tag}] Avatar file not found: ${resolvedPath}`);
       }
     }
 
@@ -988,7 +990,15 @@ for (const bot of config.bots) {
         },
         {
           name: 'nplay',
-          description: 'Plays the default audio track (a1.mp3)'
+          description: 'Plays a song via Lavalink or the default track',
+          options: [
+            {
+              name: 'query',
+              type: 3, // STRING
+              description: 'Song title, artist, or URL to play',
+              required: false
+            }
+          ]
         },
         {
           name: 'nstop',
@@ -1017,24 +1027,6 @@ for (const bot of config.bots) {
         {
           name: 'nhelp',
           description: 'Shows the help message'
-        },
-        {
-          name: 'nroast',
-          description: 'Roasts a member with a random line from the text file',
-          options: [
-            {
-              name: 'member',
-              type: 6, // USER type
-              description: 'The member to roast',
-              required: true,
-            },
-            {
-              name: 'times',
-              type: 4, // INTEGER type
-              description: 'How many times to roast (default 10)',
-              required: false,
-            }
-          ]
         },
         {
           name: 'whitelist',
@@ -1373,15 +1365,21 @@ for (const bot of config.bots) {
           description: 'Play an interactive minigame with the bot'
         }
       ], defaultGuildId);
-      console.log(`${client.user.tag} slash commands registered in guild ${defaultGuildId}.`);
+      // Slash commands registered
     } catch (err) {
-      console.error(`Failed to register slash commands for ${client.user.tag}:`, err);
+      console.warn(`[${client.user.tag}] Slash commands note: ${err.message}`);
     }
 
     if (bot.guildId && bot.channelId) {
       intentionalLeave = false;
       joinChannel(bot.guildId, bot.channelId);
     }
+  });
+
+  client.on('raw', (packet) => {
+    try {
+      poru.packetUpdate(packet);
+    } catch (err) {}
   });
 
   client.on('voiceStateUpdate', async (oldState, newState) => {
@@ -1400,7 +1398,10 @@ for (const bot of config.bots) {
 
     if (!newState.channelId) {
       if (!intentionalLeave && !isJoining) {
-        console.log(`${client.user.tag} was disconnected from voice channel. Reconnecting...`);
+        if (bot._hasConnectedVoice) {
+          bot._hasConnectedVoice = false;
+          console.log(`[${client.user.tag}] Voice disconnected. Reconnecting...`);
+        }
         player.stop();
         triggerReconnect();
       }
@@ -1419,7 +1420,7 @@ for (const bot of config.bots) {
 
     const commandName = interaction.commandName;
     const allSlashCommands = [
-      'tag', 'clear', 'njoin', 'nplay', 'nleave', 'nstop', 'npleave', 'n700', 'n1000', 'ogvc', 'nhelp', 'nroast', 'whitelist', '1wl',
+      'tag', 'clear', 'njoin', 'nplay', 'nleave', 'nstop', 'npleave', 'n700', 'n1000', 'ogvc', 'nhelp', 'whitelist', '1wl',
       'nshuffle', 'nstopshuffle', 'shuffle', 'stopshuffle',
       'wllist',
       'nkick', 'kick', 'nban', 'ban', 'ntimeout', 'timeout', 'nuntimeout', 'untimeout',
@@ -1455,11 +1456,6 @@ for (const bot of config.bots) {
 
     // Allow anyone to play the playgame minigame
     if (commandName === 'playgame') {
-      isAllowed = true;
-    }
-
-    // MJ is allowed to run roast commands on all bots (e.g. to toggle defense)
-    if (interaction.user.id === '1309948486711509017' && commandName === 'nroast') {
       isAllowed = true;
     }
 
@@ -1542,8 +1538,64 @@ for (const bot of config.bots) {
     }
 
     else if (commandName === 'nplay') {
-      if (!connection) {
-        return interaction.reply({ content: 'I am not in a voice channel.', ephemeral: true });
+      const query = interaction.options.getString('query')?.trim();
+      const vc = interaction.member?.voice?.channel;
+
+      const hasConnectedNode = poru && Array.from(poru.nodes.values()).some(n => n.isConnected);
+
+      if (query && hasConnectedNode) {
+        if (!vc) {
+          return interaction.reply({ content: 'Join a voice channel first to play a song.', ephemeral: true });
+        }
+
+        await interaction.deferReply();
+        try {
+          if (player.state.status === 'playing') {
+            player.stop();
+          }
+
+          const poruPlayer = poru.createConnection({
+            guildId: interaction.guild.id,
+            voiceChannel: vc.id,
+            textChannel: interaction.channel.id,
+            deaf: false
+          });
+
+          const resolveSource = query.startsWith('http://') || query.startsWith('https://') ? null : 'ytsearch';
+          const res = await poru.resolve({ query, source: resolveSource, requester: interaction.user });
+
+          if (!res || res.loadType === 'error' || res.loadType === 'empty' || !res.tracks.length) {
+            return interaction.editReply({ content: `❌ No results found for \`${query}\`.` });
+          }
+
+          if (res.loadType === 'playlist') {
+            for (const track of res.tracks) {
+              poruPlayer.queue.add(track);
+            }
+            if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
+            return interaction.editReply({ content: `🎶 Added playlist **${res.playlistInfo?.name || query}** (${res.tracks.length} tracks) to queue.` });
+          } else {
+            const track = res.tracks[0];
+            poruPlayer.queue.add(track);
+            if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
+            return interaction.editReply({ content: `🎵 Added to queue: **${track.info.title}** by **${track.info.author}**` });
+          }
+        } catch (err) {
+          console.error('[nplay Slash Error]:', err);
+          return interaction.editReply({ content: `⚠️ Error playing song via Lavalink: ${err.message || 'Unknown error'}` });
+        }
+      }
+
+      if (!vc) {
+        return interaction.reply({ content: 'Join a voice channel first to play audio.', ephemeral: true });
+      }
+
+      if (!connection || bot.channelId !== vc.id) {
+        bot.guildId = vc.guild.id;
+        bot.channelId = vc.id;
+        intentionalLeave = false;
+        await joinChannel(vc.guild.id, vc.id);
+        await new Promise(r => setTimeout(r, 600));
       }
 
       let resource;
@@ -1571,13 +1623,18 @@ for (const bot of config.bots) {
       resource.volume.setVolume(currentVolume);
       player.play(resource);
 
-      return interaction.reply({ content: `Playing audio (Volume: ${currentVolume * 100}%, Bass Boost: ${currentBassBoost ? 'ON' : 'OFF'}).` });
+      const notice = query && !hasConnectedNode ? ' (Lavalink node unreachable, playing local audio)' : '';
+      return interaction.reply({ content: `Playing audio (Volume: ${currentVolume * 100}%, Bass Boost: ${currentBassBoost ? 'ON' : 'OFF'})${notice}.` });
     }
 
     else if (commandName === 'nstop') {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
+      const poruPlayer = poru?.players.get(interaction.guild?.id);
+      if (poruPlayer) {
+        try { poruPlayer.destroy(); } catch (err) {}
+      }
       return interaction.reply({ content: 'Stopped audio playback.' });
     }
 
@@ -1585,6 +1642,10 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
+      const poruPlayer = poru?.players.get(interaction.guild?.id);
+      if (poruPlayer) {
+        try { poruPlayer.destroy(); } catch (err) {}
+      }
       if (!connection) {
         bot.guildId = defaultGuildId;
         bot.channelId = defaultChannelId;
@@ -1615,6 +1676,10 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
+      const poruPlayer = poru?.players.get(interaction.guild?.id);
+      if (poruPlayer) {
+        try { poruPlayer.destroy(); } catch (err) {}
+      }
 
       if (reconnectTimeout) {
         clearTimeout(reconnectTimeout);
@@ -1689,37 +1754,6 @@ for (const bot of config.bots) {
 
     else if (commandName === 'nhelp') {
       return sendAnimatedHelp(interaction, interaction.guild, client.user);
-    }
-
-    else if (commandName === 'nroast') {
-      const targetUser = interaction.options.getUser('member');
-      let times = interaction.options.getInteger('times') ?? 10;
-      if (times > 50) times = 50;
-      if (times < 1) times = 1;
-
-      if (roasts.length === 0) {
-        return interaction.reply({ content: 'Roast list is empty or could not be loaded.', ephemeral: true });
-      }
-
-      let roastTarget = targetUser;
-      const isAdminTarget = (targetUser.id === '1309948486711509017') || (targetUser.username && targetUser.username.toLowerCase() === 'activatemj');
-
-      if (isAdminTarget) {
-        if (currentActiveIndex < 10) {
-          if (adminDefenseEnabled) {
-            roastTarget = interaction.user;
-            await interaction.reply({ content: "You think you can roast the admin? Nice try. Let's see how you handle this!", ephemeral: false });
-          } else {
-            await interaction.reply({ content: `Starting roast sequence targeting ${roastTarget} (${times} times)...`, ephemeral: true });
-          }
-        } else {
-          return interaction.reply({ content: "You cannot roast this user.", ephemeral: true });
-        }
-      } else {
-        await interaction.reply({ content: `Starting roast sequence targeting ${roastTarget} (${times} times)...`, ephemeral: true });
-      }
-
-      startRoastSequence(interaction.channel, roastTarget, times, currentActiveIndex);
     }
 
     else if (commandName === 'whitelist' || commandName === '1wl' || commandName === 'wllist') {
@@ -2134,174 +2168,242 @@ for (const bot of config.bots) {
       return message.reply(`Successfully added <@${targetId}> (ID: ${targetId}) to this server's whitelist.`);
     }
 
-    if (commandNameText === '!mimic') {
+    // Nickname management commands (!nick, !nickname, !nnick, etc.)
+    if (['!nick', '!nnick', '!nickname', '!nnickname'].includes(commandNameText)) {
       const botsInGuild = activeBots
         .filter(activeBot => activeBot.configuredGuildId === message.guild.id)
         .sort((a, b) => a.index - b.index);
-      if (botsInGuild.length > 1 && botsInGuild[0].index !== currentActiveIndex) return;
 
-      if (!isOwnerOrAdmin(message.author.id, message.guild.id)) {
+      if (!isOwnerOrAdmin(message.author.id, message.guild.id, message.member, message.guild)) {
+        if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
         return message.reply('You do not have permission to change this server profile.');
       }
 
-      const requestedAsset = (args[1] || 'all').toLowerCase();
-      if (!['all', 'avatar', 'banner'].includes(requestedAsset)) {
-        return message.reply('Usage: `!mimic [avatar|banner|all]`');
+      const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
+      const newNick = args.slice(1).join(' ').trim();
+      const isReset = !newNick || newNick.toLowerCase() === 'reset';
+
+      try {
+        if (isReset) {
+          try {
+            await message.guild.members.me.setNickname(null);
+          } catch (nickErr) {
+            console.warn(`[${client.user.tag}] setNickname error:`, nickErr.message);
+          }
+          if (isPrimaryInGuild) {
+            return message.reply("Reset bot nickname in this server.");
+          }
+          return;
+        }
+
+        if (newNick.length > 32) {
+          if (isPrimaryInGuild) {
+            return message.reply('Nickname cannot exceed 32 characters.');
+          }
+          return;
+        }
+
+        try {
+          await message.guild.members.me.setNickname(newNick);
+        } catch (nickErr) {
+          console.warn(`[${client.user.tag}] setNickname error:`, nickErr.message);
+        }
+
+        if (isPrimaryInGuild) {
+          return message.reply(`Updated server nickname to "${newNick}".`);
+        }
+        return;
+      } catch (err) {
+        if (isPrimaryInGuild) {
+          return message.reply(`Could not update server nickname: ${err.message}`);
+        }
+        return;
+      }
+    }
+
+    if (commandNameText === '!mimic' || commandNameText === '!nmimic') {
+      const botsInGuild = activeBots
+        .filter(activeBot => activeBot.configuredGuildId === message.guild.id)
+        .sort((a, b) => a.index - b.index);
+
+      if (!isOwnerOrAdmin(message.author.id, message.guild.id, message.member, message.guild)) {
+        if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
+        return message.reply('You do not have permission to change this server profile.');
+      }
+
+      const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
+
+      let subArg = (args[1] || 'all').toLowerCase();
+      if (subArg === 'icon' || subArg === 'pfp') subArg = 'avatar';
+      if (subArg === 'name') subArg = 'nick';
+
+      if (!['all', 'avatar', 'nick', 'banner'].includes(subArg)) {
+        if (!isPrimaryInGuild) return;
+        return message.reply('Usage: `!mimic [icon|nick|all]`');
+      }
+
+      if (subArg === 'banner') {
+        if (!isPrimaryInGuild) return;
+        return message.reply('Discord does not support banners for bot accounts via the API. Use `!mimic icon` to copy the server icon, or `!mimic nick` to copy the server name.');
       }
 
       try {
         const guild = await message.guild.fetch();
-        const avatarUrl = requestedAsset !== 'banner' && guild.iconURL({
-          extension: guild.icon?.startsWith('a_') ? 'gif' : 'png',
-          size: 1024
-        });
-        const bannerUrl = requestedAsset !== 'avatar' && guild.bannerURL({
-          extension: guild.banner?.startsWith('a_') ? 'gif' : 'png',
-          size: 1024
-        });
-        const updates = {};
-        const copiedAssets = [];
-        const skippedAssets = [];
+        const actionsPerformed = [];
 
-        for (const [asset, imageUrl, maximumSize] of [
-          ['avatar', avatarUrl, 4 * 1024 * 1024],
-          ['banner', bannerUrl, 8 * 1024 * 1024]
-        ]) {
-          if (requestedAsset !== 'all' && requestedAsset !== asset) continue;
-          if (!imageUrl) {
-            skippedAssets.push(asset);
-            continue;
+        // 1. Copy Server Name to Nickname
+        if (subArg === 'nick' || subArg === 'all') {
+          const serverNameNick = guild.name.slice(0, 32);
+          try {
+            await message.guild.members.me.setNickname(serverNameNick);
+            actionsPerformed.push(`server nickname to "${serverNameNick}"`);
+          } catch (nickErr) {
+            console.warn(`[${client.user.tag}] mimic setNickname error:`, nickErr.message);
           }
-
-          const imageResponse = await fetch(imageUrl);
-          if (!imageResponse.ok) {
-            throw new Error(`Could not download the server ${asset} (HTTP ${imageResponse.status}).`);
-          }
-
-          const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
-          if (imageBytes.length > maximumSize) {
-            throw new Error(`The server ${asset} exceeds the ${asset === 'avatar' ? '4' : '8'} MB size limit.`);
-          }
-          updates[asset] = imageBytes;
-          copiedAssets.push(asset);
         }
 
-        if (copiedAssets.length === 0) {
-          return message.reply(`This server does not have a ${skippedAssets.join(' or ')} to copy.`);
-        }
+        // 2. Copy Server Icon to Avatar
+        if (subArg === 'avatar' || subArg === 'all') {
+          const iconUrl = guild.iconURL({
+            extension: 'png',
+            size: 1024,
+            forceStatic: true
+          });
 
-        try {
-          await guild.members.editMe(updates);
-        } catch (err) {
-          if (updates.avatar && updates.banner && /banner|boost|50035|invalid form body/i.test(err.message || '')) {
-            await guild.members.editMe({ avatar: updates.avatar });
-            return message.reply(`Copied the server avatar. Discord rejected the server banner: ${err.message}`);
+          if (!iconUrl) {
+            if (actionsPerformed.length === 0) {
+              if (!isPrimaryInGuild) return;
+              return message.reply('This server does not have an icon to copy.');
+            }
+          } else {
+            const imageResponse = await fetch(iconUrl);
+            if (!imageResponse.ok) {
+              throw new Error(`Failed to download server icon (HTTP ${imageResponse.status})`);
+            }
+            const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
+
+            if (isPrimaryInGuild) {
+              try {
+                await client.user.setAvatar(imageBytes);
+                actionsPerformed.push("server icon to bot avatar");
+              } catch (avatarErr) {
+                if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
+                  actionsPerformed.push("(avatar change rate-limited by Discord; try again in a few minutes)");
+                } else {
+                  console.warn(`[${client.user.tag}] setAvatar error:`, avatarErr.message);
+                }
+              }
+            } else {
+              const guildBotPos = botsInGuild.findIndex(b => b.index === currentActiveIndex);
+              setTimeout(async () => {
+                try {
+                  await client.user.setAvatar(imageBytes);
+                } catch {}
+              }, Math.max(1, guildBotPos) * 1500);
+            }
           }
-          throw err;
         }
 
-        const result = `Copied this server's ${copiedAssets.join(' and ')} to the bot profile.`;
-        const skipped = skippedAssets.length ? ` No server ${skippedAssets.join(' or ')} was available.` : '';
-        return message.reply(result + skipped);
+        if (isPrimaryInGuild) {
+          if (actionsPerformed.length > 0) {
+            return message.reply(`Updated ${actionsPerformed.join(' and ')}.`);
+          } else {
+            return message.reply('No server profile changes could be applied.');
+          }
+        }
+        return;
       } catch (err) {
-        console.error('Failed to mimic server artwork:', err);
-        return message.reply(`Could not mimic server artwork: ${err.message}`);
+        if (isPrimaryInGuild) {
+          console.error('Failed to mimic server artwork:', err.message);
+          return message.reply(`Could not mimic server artwork: ${err.message}`);
+        }
+        return;
       }
     }
 
-    if (commandNameText === '!avatar' || commandNameText === '!banner') {
+    if (['!avatar', '!navatar', '!banner', '!nbanner'].includes(commandNameText)) {
       const botsInGuild = activeBots
         .filter(activeBot => activeBot.configuredGuildId === message.guild.id)
         .sort((a, b) => a.index - b.index);
-      if (botsInGuild.length > 1 && botsInGuild[0].index !== currentActiveIndex) return;
 
-      if (!isOwnerOrAdmin(message.author.id, message.guild.id)) {
+      if (!isOwnerOrAdmin(message.author.id, message.guild.id, message.member, message.guild)) {
+        if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
         return message.reply('You do not have permission to change this server profile.');
       }
 
-      const profileAsset = commandNameText.slice(1);
+      const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
+      const profileAsset = commandNameText.replace(/^!n?/, '');
+
+      if (profileAsset === 'banner') {
+        if (!isPrimaryInGuild) return;
+        return message.reply('Discord does not support banners for bot accounts via the API (Discord restricts bot banners to the Developer Portal app settings). You can set the bot avatar with `!avatar` or nickname with `!nick`.');
+      }
+
       const resetRequested = args[1]?.toLowerCase() === 'reset';
       try {
         if (resetRequested) {
-          await message.guild.members.editMe({ [profileAsset]: null });
-          return message.reply(`Reset this server's bot ${profileAsset}.`);
-        }
-
-        const attachment = message.attachments.first();
-        if (!attachment) {
-          return message.reply(`Attach a PNG, JPEG, GIF, or WEBP image with \`${commandNameText}\`, or use \`${commandNameText} reset\`.`);
-        }
-
-        const allowedImageTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
-        const imageType = attachment.contentType?.split(';')[0].toLowerCase();
-        const maximumSize = profileAsset === 'avatar' ? 4 * 1024 * 1024 : 8 * 1024 * 1024;
-        if (!allowedImageTypes.includes(imageType)) {
-          return message.reply('Use a PNG, JPEG, GIF, or WEBP image.');
-        }
-        if (attachment.size > maximumSize) {
-          return message.reply(`The ${profileAsset} image must be no larger than ${profileAsset === 'avatar' ? '4' : '8'} MB.`);
-        }
-
-        const imageResponse = await fetch(attachment.url);
-        if (!imageResponse.ok) {
-          return message.reply(`Could not download that image (HTTP ${imageResponse.status}).`);
-        }
-        const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
-        if (imageBytes.length > maximumSize) {
-          return message.reply(`The ${profileAsset} image exceeds the size limit.`);
-        }
-
-        await message.guild.members.editMe({ [profileAsset]: imageBytes });
-        return message.reply(`Updated this server's bot ${profileAsset}.`);
-      } catch (err) {
-        console.error(`Failed to update the server ${profileAsset}:`, err);
-        return message.reply(`Could not update the server ${profileAsset}: ${err.message}`);
-      }
-    }
-
-    // Check if the message is a reply to one of our roast messages from the targeted user
-    if (message.reference && message.reference.messageId) {
-      const referencedRoast = recentRoasts.get(message.reference.messageId);
-      if (referencedRoast) {
-        if (message.author.id === referencedRoast.targetId) {
-          if (referencedRoast.clientIndex === currentActiveIndex) {
-            await message.reply("Replying back? Big mistake. Get ready for 50 more roasts!");
-            startRoastSequence(message.channel, message.author, 50, currentActiveIndex);
-          }
-          return;
-        }
-      }
-    }
-
-    // Passive mention roast (only if enabled and on bots 1-10)
-    if (adminDefenseEnabled && message.mentions.users.has('1309948486711509017')) {
-      if (currentActiveIndex < 10) {
-        const botsInGuild = activeBots.filter(b => b.index < 10 && b.configuredGuildId === message.guild.id);
-        if (botsInGuild.length > 0) {
-          botsInGuild.sort((a, b) => a.index - b.index);
-          let hash = 0;
-          for (let i = 0; i < message.id.length; i++) {
-            hash = message.id.charCodeAt(i) + ((hash << 5) - hash);
-          }
-          const selectedIndex = Math.abs(hash) % botsInGuild.length;
-          const selectedBot = botsInGuild[selectedIndex];
-          if (selectedBot.index === currentActiveIndex) {
-            if (roasts.length > 0) {
-              const randomRoast = roasts[Math.floor(Math.random() * roasts.length)];
-              const roastMessage = randomRoast.replace(/@username/gi, message.author.toString());
-              try {
-                const sentMsg = await message.reply(roastMessage);
-                recentRoasts.set(sentMsg.id, {
-                  targetId: message.author.id,
-                  clientIndex: currentActiveIndex
-                });
-              } catch (err) {
-                console.error('Failed to send mention roast:', err);
-              }
+          if (isPrimaryInGuild) {
+            try {
+              await client.user.setAvatar(null);
+              return message.reply("Reset bot avatar.");
+            } catch (err) {
+              return message.reply(`Could not reset avatar: ${err.message}`);
             }
           }
           return;
         }
+
+        const attachment = message.attachments.first();
+        if (!attachment) {
+          if (isPrimaryInGuild) {
+            return message.reply('Attach a PNG, JPEG, GIF, or WEBP image with `!avatar`, or use `!avatar reset`.');
+          }
+          return;
+        }
+
+        const allowedImageTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+        const imageType = attachment.contentType?.split(';')[0].toLowerCase();
+        const maximumSize = 8 * 1024 * 1024;
+        if (!allowedImageTypes.includes(imageType)) {
+          if (isPrimaryInGuild) {
+            return message.reply('Use a PNG, JPEG, GIF, or WEBP image.');
+          }
+          return;
+        }
+        if (attachment.size > maximumSize) {
+          if (isPrimaryInGuild) {
+            return message.reply('The image must be no larger than 8 MB.');
+          }
+          return;
+        }
+
+        const imageResponse = await fetch(attachment.url);
+        if (!imageResponse.ok) {
+          if (isPrimaryInGuild) {
+            return message.reply(`Could not download image (HTTP ${imageResponse.status}).`);
+          }
+          return;
+        }
+        const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
+
+        if (isPrimaryInGuild) {
+          try {
+            await client.user.setAvatar(imageBytes);
+            return message.reply("Updated bot avatar.");
+          } catch (avatarErr) {
+            if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
+              return message.reply('Discord rate-limits avatar changes to twice per 10 minutes. Please wait a few minutes before trying again.');
+            }
+            throw avatarErr;
+          }
+        }
+        return;
+      } catch (err) {
+        if (isPrimaryInGuild) {
+          console.error('Failed to update avatar:', err.message);
+          return message.reply(`Could not update avatar: ${err.message}`);
+        }
+        return;
       }
     }
 
@@ -2309,7 +2411,6 @@ for (const bot of config.bots) {
     const contentLower = normalizedContent.toLowerCase();
     const isTagCommand = contentLower.startsWith('!ntag');
     const isClearCommand = contentLower === '!nclear' || contentLower.startsWith('!nclear ');
-    const isRoastCommand = contentLower.startsWith('!nroast');
     const isShuffleCommand = contentLower.startsWith('!nshuffle') || contentLower.startsWith('!shuffle') || contentLower.startsWith('shuffle') || contentLower.startsWith('nshuffle');
     const isStopShuffleCommand = contentLower.startsWith('!nstopshuffle') || contentLower.startsWith('!stopshuffle') || contentLower.startsWith('stopshuffle') || contentLower === 'stop shuffle' || contentLower === '!stop shuffle' || contentLower === 'nstop shuffle' || contentLower === '!nstop shuffle';
     const isKickCommand = contentLower.startsWith('!nkick') || contentLower.startsWith('!kick');
@@ -2324,8 +2425,9 @@ for (const bot of config.bots) {
     const joinMatch = contentLower.match(/^!njoin(\d+)$/);
     const isSingleJoinCommand = !!joinMatch;
     const isClearAllCommand = contentLower === '!nclearall';
+    const isPlayCommand = contentLower === '!nplay' || contentLower.startsWith('!nplay ') || contentLower === '!play' || contentLower.startsWith('!play ');
     const allowedCommands = ['!njoin', '!nplay', '!nleave', '!nstop', '!npleave', '!nhelp', '!n700', '!n1000', '!ogvc'];
-    if (allowedCommands.includes(contentLower) || isTagCommand || isClearCommand || isRoastCommand || isShuffleCommand || isStopShuffleCommand || isKickCommand || isBanCommand || isTimeoutCommand || isUntimeoutCommand || isPingCommand || isModCommand || isSingleJoinCommand || isClearAllCommand || isServerMuteCommand || isServerUnmuteCommand || isMoveAllCommand) {
+    if (allowedCommands.includes(contentLower) || isPlayCommand || isTagCommand || isClearCommand || isShuffleCommand || isStopShuffleCommand || isKickCommand || isBanCommand || isTimeoutCommand || isUntimeoutCommand || isPingCommand || isModCommand || isSingleJoinCommand || isClearAllCommand || isServerMuteCommand || isServerUnmuteCommand || isMoveAllCommand) {
       let isAllowed = false;
 
       // Owner (allowed on all bots, all servers)
@@ -2347,11 +2449,6 @@ for (const bot of config.bots) {
         if (message.member?.permissions?.has('ManageMessages') || message.member?.permissions?.has('Administrator')) {
           isAllowed = true;
         }
-      }
-
-      // MJ is allowed to run roast commands on all bots (e.g. to toggle defense)
-      if (message.author.id === '1309948486711509017' && isRoastCommand) {
-        isAllowed = true;
       }
 
       // Permissions for Bots 1-10
@@ -2545,125 +2642,6 @@ for (const bot of config.bots) {
       return message.reply('Shuffle loop stopped successfully.');
     }
 
-    // !nroast
-    if (isRoastCommand) {
-      // Coordinate to ensure only one bot instance replies in the guild channel
-      const botsInGuild = activeBots.filter(b => b.configuredGuildId === message.guild.id);
-      if (botsInGuild.length > 0) {
-        botsInGuild.sort((a, b) => a.index - b.index);
-        let hash = 0;
-        for (let i = 0; i < message.id.length; i++) {
-          hash = message.id.charCodeAt(i) + ((hash << 5) - hash);
-        }
-        const selectedIndex = Math.abs(hash) % botsInGuild.length;
-        const selectedBot = botsInGuild[selectedIndex];
-        if (selectedBot.index !== currentActiveIndex) {
-          return;
-        }
-      }
-
-      // Parse arguments
-      const commandLength = message.content.trim().split(/\s+/, 1)[0].length;
-      const argsStr = message.content.trim().slice(commandLength).trim();
-      const words = argsStr.split(/\s+/).filter(w => w.length > 0);
-
-      if (words.length === 0) {
-        return message.reply('Please specify a member or text to roast. Example: `!nroast @member [times]` or `!nroast activatemj`');
-      }
-
-      const rawArgs = argsStr.toLowerCase();
-
-      // 1. !nroast stop
-      if (rawArgs === 'stop') {
-        stopRoastsInChannel(message.channel.id);
-        return message.reply("Roast sequence stopped in this channel.");
-      }
-
-      // 2. !nroast activatemj / !nroast active mj / !nroast activate mj
-      if (rawArgs === 'activatemj' || rawArgs === 'active mj' || rawArgs === 'activate mj') {
-        const isAuthorized = message.author.id === '1048900823314354197' || message.author.id === '1309948486711509017';
-        if (isAuthorized) {
-          adminDefenseEnabled = true;
-          return message.reply("Admin roast defense activated!");
-        } else {
-          if (currentActiveIndex < 10) {
-            await message.reply("You think you can roast the admin? Nice try. Let's see how you handle this!");
-            startRoastSequence(message.channel, message.author, 10, currentActiveIndex);
-            return;
-          }
-        }
-      }
-
-      // 3. !nroast deactivate mj / !nroast deactivatemj
-      if (rawArgs === 'deactivate mj' || rawArgs === 'deactivatemj') {
-        const isAuthorized = message.author.id === '1048900823314354197' || message.author.id === '1309948486711509017';
-        if (isAuthorized) {
-          adminDefenseEnabled = false;
-          return message.reply("Admin roast defense deactivated!");
-        } else {
-          if (currentActiveIndex < 10) {
-            await message.reply("You think you can roast the admin? Nice try. Let's see how you handle this!");
-            startRoastSequence(message.channel, message.author, 10, currentActiveIndex);
-            return;
-          }
-        }
-      }
-
-      let targetText = '';
-      let times = 10;
-
-      const lastWord = words[words.length - 1];
-      if (words.length > 1 && /^\d+$/.test(lastWord)) {
-        const parsed = parseInt(lastWord, 10);
-        if (parsed > 0) {
-          times = parsed;
-        }
-        targetText = words.slice(0, -1).join(' ');
-      } else {
-        targetText = words.join(' ');
-      }
-
-      if (times > 50) {
-        times = 50;
-      }
-      if (times < 1) {
-        times = 1;
-      }
-
-      if (roasts.length === 0) {
-        return message.reply('Roast list is empty or could not be loaded.');
-      }
-
-      let roastTarget = targetText;
-      const mentionMatch = targetText.match(/^<@!?(\d+)>$/);
-      let targetUserId = null;
-
-      if (mentionMatch) {
-        targetUserId = mentionMatch[1];
-        const targetUserObj = message.mentions.users.get(targetUserId);
-        if (targetUserObj) {
-          roastTarget = targetUserObj;
-        }
-      }
-
-      const isAdminTarget = (targetUserId === '1309948486711509017') || (typeof roastTarget === 'string' && roastTarget.toLowerCase() === 'activatemj');
-      
-      if (isAdminTarget) {
-        if (currentActiveIndex < 10) {
-          if (adminDefenseEnabled) {
-            roastTarget = message.author;
-            await message.reply("You think you can roast the admin? Nice try. Let's see how you handle this!");
-          }
-        } else {
-          return; // Ignore completely on other bots (11-23)
-        }
-      }
-
-      await message.reply(`Starting to roast ${roastTarget} ${times} times...`);
-      startRoastSequence(message.channel, roastTarget, times, currentActiveIndex);
-      return;
-    }
-
     // !njoin<index>
     if (isSingleJoinCommand) {
       const parsedNum = parseInt(joinMatch[1], 10);
@@ -2702,10 +2680,83 @@ for (const bot of config.bots) {
       return message.reply('Joining the voice channel.');
     }
 
-    // !nplay
-    if (contentLower === '!nplay') {
-      if (!connection) {
-        return message.reply('I am not in a voice channel.');
+    // !nplay or !play
+    if (isPlayCommand) {
+      let query = '';
+      const spaceIdx = message.content.indexOf(' ');
+      if (spaceIdx !== -1) {
+        query = message.content.slice(spaceIdx + 1).trim();
+      }
+
+      const vc = message.member?.voice?.channel;
+      if (!vc) {
+        return message.reply('Join a voice channel first to play audio.');
+      }
+
+      // Check all active bots for this guild
+      const botsInThisGuild = activeBots
+        .filter(b => b.configuredGuildId === message.guild.id)
+        .sort((a, b) => a.index - b.index);
+
+      // Find if any bot is already in user's VC
+      const botInVc = botsInThisGuild.find(b => {
+        const memberMe = b.client.guilds.cache.get(message.guild.id)?.members.me;
+        return memberMe?.voice?.channelId && memberMe.voice.channelId === vc.id;
+      });
+
+      // Exactly ONE bot responds: the one in the VC, or the first bot configured for this guild
+      const targetBot = botInVc || botsInThisGuild[0];
+      if (targetBot && targetBot.index !== currentActiveIndex) {
+        return;
+      }
+
+      // If a song query is provided, play via Lavalink
+      const hasConnectedNode = poru && Array.from(poru.nodes.values()).some(n => n.isConnected);
+      if (query && hasConnectedNode) {
+        try {
+          if (player.state.status === 'playing') {
+            player.stop();
+          }
+
+          const poruPlayer = poru.createConnection({
+            guildId: message.guild.id,
+            voiceChannel: vc.id,
+            textChannel: message.channel.id,
+            deaf: false
+          });
+
+          const resolveSource = query.startsWith('http://') || query.startsWith('https://') ? null : 'ytsearch';
+          const res = await poru.resolve({ query, source: resolveSource, requester: message.author });
+
+          if (!res || res.loadType === 'error' || res.loadType === 'empty' || !res.tracks?.length) {
+            return message.reply(`❌ No results found for \`${query}\`.`);
+          }
+
+          if (res.loadType === 'playlist') {
+            for (const track of res.tracks) {
+              poruPlayer.queue.add(track);
+            }
+            if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
+            return message.reply(`🎶 Added playlist **${res.playlistInfo?.name || query}** (${res.tracks.length} tracks) to queue.`);
+          } else {
+            const track = res.tracks[0];
+            poruPlayer.queue.add(track);
+            if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
+            return message.reply(`🎵 Added to queue: **${track.info.title}** by **${track.info.author}**`);
+          }
+        } catch (err) {
+          console.error('[!nplay Lavalink Error]:', err);
+          return message.reply(`⚠️ Lavalink error: ${err.message || 'Unknown'}.`);
+        }
+      }
+
+      // Normal play command (or fallback): play the recorded audio (a1.mp3)
+      if (!connection || bot.channelId !== vc.id) {
+        bot.guildId = vc.guild.id;
+        bot.channelId = vc.id;
+        intentionalLeave = false;
+        await joinChannel(vc.guild.id, vc.id);
+        await new Promise(r => setTimeout(r, 600));
       }
 
       let resource;
@@ -2733,7 +2784,8 @@ for (const bot of config.bots) {
       resource.volume.setVolume(currentVolume);
       player.play(resource);
 
-      return message.reply(`Playing audio (Volume: ${currentVolume * 100}%, Bass Boost: ${currentBassBoost ? 'ON' : 'OFF'}).`);
+      const notice = query && !hasConnectedNode ? ' (Lavalink node unreachable, playing recorded audio)' : '';
+      return message.reply(`Playing recorded audio (Volume: ${currentVolume * 100}%, Bass Boost: ${currentBassBoost ? 'ON' : 'OFF'})${notice}.`);
     }
 
     // !nstop
@@ -2741,6 +2793,10 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
+      const poruPlayer = poru?.players.get(message.guild?.id);
+      if (poruPlayer) {
+        try { poruPlayer.destroy(); } catch (err) {}
+      }
       return message.reply('Stopped audio playback.');
     }
 
@@ -2749,6 +2805,10 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
+      const poruPlayer = poru?.players.get(message.guild?.id);
+      if (poruPlayer) {
+        try { poruPlayer.destroy(); } catch (err) {}
+      }
       if (!connection) {
         // If not connected, join the original channel anyway
         bot.guildId = defaultGuildId;
@@ -2781,6 +2841,10 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
+      const poruPlayer = poru?.players.get(message.guild?.id);
+      if (poruPlayer) {
+        try { poruPlayer.destroy(); } catch (err) {}
+      }
 
       if (reconnectTimeout) {
         clearTimeout(reconnectTimeout);
@@ -3206,5 +3270,7 @@ for (const bot of config.bots) {
     continue;
   }
 
-  client.login(bot.token).catch(console.error);
+  client.login(bot.token).catch(err => {
+    console.warn(`[Bot ${currentActiveIndex + 1}] Login notice: ${err.message}`);
+  });
 }

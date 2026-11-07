@@ -1,13 +1,20 @@
 const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const repositoryPath = __dirname;
 const remoteName = process.env.GIT_REMOTE || 'origin';
 const branchName = process.env.GIT_BRANCH || 'main';
-const intervalMs = Number(process.env.GIT_PULL_INTERVAL_MS || 60_000);
-const maximumBackoffMs = 30 * 60_000;
+const intervalMs = Math.max(10_000, Number(process.env.GIT_PULL_INTERVAL_MS || 30_000));
+const autoRestart = process.env.GIT_AUTO_RESTART !== 'false';
+const maxFailureDelayMs = 60_000; // Cap failure delay to 1 minute maximum
 
-if (!Number.isSafeInteger(intervalMs) || intervalMs < 60_000) {
-  throw new Error('GIT_PULL_INTERVAL_MS must be an integer of at least 60000 milliseconds.');
+function isGitRepo() {
+  try {
+    return fs.existsSync(path.join(repositoryPath, '.git'));
+  } catch {
+    return false;
+  }
 }
 
 function runGit(args) {
@@ -15,18 +22,19 @@ function runGit(args) {
     cwd: repositoryPath,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 60_000
+    timeout: 30_000
   }).trim();
 }
 
 let isChecking = false;
-let timer;
+let timer = null;
 let consecutiveFailures = 0;
 let lastError = null;
 let wasDirty = false;
 let branchMismatch = false;
 
 function scheduleNextCheck(delay) {
+  clearTimeout(timer);
   timer = setTimeout(checkForUpdates, delay);
 }
 
@@ -35,13 +43,20 @@ function checkForUpdates() {
     scheduleNextCheck(intervalMs);
     return;
   }
+
+  if (!isGitRepo()) {
+    console.warn('[git-watchdog] No .git directory found; auto-pull disabled.');
+    return;
+  }
+
   isChecking = true;
 
   try {
+    // 1. Verify current checked-out branch
     const currentBranch = runGit(['branch', '--show-current']);
-    if (currentBranch !== branchName) {
+    if (currentBranch && currentBranch !== branchName) {
       if (!branchMismatch) {
-        console.warn(`[git-watchdog] Paused: checked out branch is "${currentBranch || '(detached)'}", expected "${branchName}".`);
+        console.warn(`[git-watchdog] Paused: checked out branch is "${currentBranch}", expected "${branchName}".`);
       }
       branchMismatch = true;
       return;
@@ -51,31 +66,54 @@ function checkForUpdates() {
       branchMismatch = false;
     }
 
-    const changes = runGit(['status', '--porcelain', '--untracked-files=normal']);
-    if (changes) {
+    // 2. Fetch latest commits from remote without touching working directory
+    runGit(['fetch', '--quiet', remoteName, branchName]);
+
+    const localCommit = runGit(['rev-parse', 'HEAD']);
+    const remoteCommit = runGit(['rev-parse', `${remoteName}/${branchName}`]);
+
+    // Already up-to-date
+    if (localCommit === remoteCommit) {
+      consecutiveFailures = 0;
+      if (lastError) {
+        console.log('[git-watchdog] Pull checks recovered.');
+        lastError = null;
+      }
+      return;
+    }
+
+    // 3. New commit available - check if tracked files have uncommitted changes (-uno ignores untracked files)
+    const dirtyTracked = runGit(['status', '--porcelain', '-uno']);
+    if (dirtyTracked) {
       if (!wasDirty) {
-        console.warn('[git-watchdog] Paused pulls while local changes are present.');
+        console.warn('[git-watchdog] New commit available on GitHub, but local modifications exist on tracked files. Pausing pull to prevent overwriting local edits.');
       }
       wasDirty = true;
       return;
     }
     if (wasDirty) {
-      console.log('[git-watchdog] Local changes are clear; pull checks resumed.');
+      console.log('[git-watchdog] Tracked files are clean; resuming auto-pull.');
       wasDirty = false;
     }
 
-    const previousCommit = runGit(['rev-parse', 'HEAD']);
+    // 4. Fast-forward pull the latest updates
+    console.log(`[git-watchdog] Update detected (${remoteCommit.slice(0, 7)}). Pulling changes from ${remoteName}/${branchName}...`);
     runGit(['pull', '--quiet', '--ff-only', remoteName, branchName]);
-    const currentCommit = runGit(['rev-parse', 'HEAD']);
-    if (currentCommit !== previousCommit) {
-      console.log(`[git-watchdog] Updated to ${currentCommit.slice(0, 12)}.`);
+    const updatedCommit = runGit(['rev-parse', 'HEAD']);
+
+    console.log(`[git-watchdog] Successfully updated from ${localCommit.slice(0, 7)} to ${updatedCommit.slice(0, 7)}.`);
+
+    // 5. Restart bot so the new code is loaded into memory
+    if (autoRestart) {
+      console.log('[git-watchdog] Exiting process in 2 seconds to allow host/Pterodactyl/PM2 to restart with updated code...');
+      setTimeout(() => {
+        process.exit(0);
+      }, 2000);
+      return; // Do not schedule next check
     }
 
     consecutiveFailures = 0;
-    if (lastError) {
-      console.log('[git-watchdog] Pull checks recovered.');
-      lastError = null;
-    }
+    lastError = null;
   } catch (error) {
     const details = error.stderr?.toString().trim() || error.message;
     consecutiveFailures++;
@@ -85,17 +123,28 @@ function checkForUpdates() {
     }
   } finally {
     isChecking = false;
-    const backoff = Math.min(intervalMs * (2 ** Math.min(consecutiveFailures, 10)), maximumBackoffMs);
+    const backoff = Math.min(intervalMs * (consecutiveFailures > 0 ? 1.5 : 1), maxFailureDelayMs);
     scheduleNextCheck(backoff);
   }
 }
 
-console.log(`[git-watchdog] Monitoring ${branchName} from ${remoteName}; checks are quiet unless the repository changes or needs attention.`);
-checkForUpdates();
+function start() {
+  if (timer) return; // Already started
+  console.log(`[git-watchdog] Active: Monitoring "${branchName}" from "${remoteName}" every ${Math.round(intervalMs / 1000)}s.`);
+  checkForUpdates();
+}
 
+// Handle termination signals cleanly
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     clearTimeout(timer);
-    process.exit(0);
   });
 }
+
+// Auto-start immediately
+start();
+
+module.exports = {
+  start,
+  checkForUpdates
+};

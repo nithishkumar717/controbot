@@ -1,4 +1,5 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 module.exports = {
   // Global Owner ID (controls all bots in all servers)
@@ -146,6 +147,7 @@ module.exports = {
           token: process.env.BOT_TOKEN_25,
           guildId: '1378208063298867271',
           channelId: '1415978780823912499',
+          nickname: null, // e.g. 'Bot 25'
           avatarPath: null, // e.g. 'assets/bot-25-avatar.png'
           bannerPath: null // e.g. 'assets/bot-25-banner.png'
       },
@@ -153,6 +155,7 @@ module.exports = {
           token: process.env.BOT_TOKEN_26,
           guildId: '1378208063298867271',
           channelId: '1415978780823912499',
+          nickname: null,
           avatarPath: null,
           bannerPath: null
       },
@@ -160,6 +163,7 @@ module.exports = {
           token: process.env.BOT_TOKEN_27,
           guildId: '1378208063298867271',
           channelId: '1415978780823912499',
+          nickname: null,
           avatarPath: null,
           bannerPath: null
       },
@@ -167,6 +171,7 @@ module.exports = {
           token: process.env.BOT_TOKEN_28,
           guildId: '1378208063298867271',
           channelId: '1415978780823912499',
+          nickname: null,
           avatarPath: null,
           bannerPath: null
       },
@@ -174,6 +179,7 @@ module.exports = {
           token: process.env.BOT_TOKEN_29,
           guildId: '1378208063298867271',
           channelId: '1415978780823912499',
+          nickname: null,
           avatarPath: null,
           bannerPath: null
       },
@@ -181,8 +187,16 @@ module.exports = {
           token: process.env.BOT_TOKEN_30,
           guildId: '1378208063298867271',
           channelId: '1415978780823912499',
+          nickname: null,
           avatarPath: null,
           bannerPath: null
       }
-  ]
+  ],
+
+  lavalink: {
+    host: process.env.LAVALINK_HOST || '193.226.78.187',
+    port: parseInt(process.env.LAVALINK_PORT || '4998', 10),
+    password: process.env.LAVALINK_PASSWORD || 'ryugalavalink',
+    secure: process.env.LAVALINK_SECURE === 'true'
+  }
 };
