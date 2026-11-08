@@ -15,6 +15,10 @@ const { Poru } = require('poru');
 const config = require('./config');
 const fs = require('fs');
 const path = require('path');
+const ffmpegStatic = require('ffmpeg-static');
+const ffmpegBin = ffmpegStatic || 'ffmpeg';
+process.env.FFMPEG_PATH = ffmpegBin;
+const defaultAudioPath = path.join(__dirname, 'audio', 'a1.mp3');
 const gitWatchdog = require('./git-watchdog');
 const proxyManager = require('./proxy-manager');
 
@@ -675,7 +679,7 @@ for (const bot of config.bots) {
 
   const player = createAudioPlayer({
     behaviors: {
-      noSubscriber: NoSubscriberBehavior.Pause,
+      noSubscriber: NoSubscriberBehavior.Play,
     },
   });
 
@@ -1458,6 +1462,26 @@ for (const bot of config.bots) {
         }
       }, staggerDelay);
     }
+
+    // 24/7 Voice Channel Watchdog: Ensure bot remains inside configured VC permanently
+    setInterval(() => {
+      if (intentionalLeave) return;
+      const targetGuildId = defaultGuildId || bot.guildId;
+      const targetChannelId = defaultChannelId || bot.channelId;
+      if (!targetGuildId || !targetChannelId) return;
+
+      const guild = client.guilds.cache.get(targetGuildId);
+      if (!guild) return;
+
+      const memberMe = guild.members.me;
+      const inVoice = memberMe?.voice?.channelId;
+
+      if (!inVoice || !connection || connection.state.status === VoiceConnectionStatus.Destroyed || connection.state.status === VoiceConnectionStatus.Disconnected) {
+        if (!isJoining && !reconnectTimeout) {
+          joinChannel(targetGuildId, targetChannelId);
+        }
+      }
+    }, 25000);
   });
 
   client.on('raw', (packet) => {
@@ -1487,7 +1511,12 @@ for (const bot of config.bots) {
         bot._hasConnectedVoice = false;
       }
       player.stop();
-      // Let the VoiceConnection stateChange listener handle auto-rejoin / reconnect without collision
+      if (!intentionalLeave) {
+        // If connection is already destroyed or lost, trigger reconnect immediately for 24/7 uptime
+        if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
+          triggerReconnect();
+        }
+      }
     } else {
       // Update target channel if bot is moved by a user and connection is ready
       if (connection && connection.state.status === VoiceConnectionStatus.Ready) {
@@ -1685,8 +1714,8 @@ for (const bot of config.bots) {
       let resource;
       if (currentBassBoost) {
         const bassGain = currentVolume >= 10.0 ? 25 : 15;
-        const ffmpegProcess = spawn('ffmpeg', [
-          '-i', './audio/a1.mp3',
+        const ffmpegProcess = spawn(ffmpegBin, [
+          '-i', defaultAudioPath,
           '-af', `bass=g=${bassGain}`,
           '-f', 's16le',
           '-ar', '48000',
@@ -1699,7 +1728,7 @@ for (const bot of config.bots) {
           inlineVolume: true
         });
       } else {
-        resource = createAudioResource('./audio/a1.mp3', {
+        resource = createAudioResource(defaultAudioPath, {
           inlineVolume: true
         });
       }
@@ -1790,8 +1819,8 @@ for (const bot of config.bots) {
       currentBassBoost = true;
       
       if (player.state.status === 'playing') {
-        const ffmpegProcess = spawn('ffmpeg', [
-          '-i', './audio/a1.mp3',
+        const ffmpegProcess = spawn(ffmpegBin, [
+          '-i', defaultAudioPath,
           '-af', 'bass=g=15',
           '-f', 's16le',
           '-ar', '48000',
@@ -1818,8 +1847,8 @@ for (const bot of config.bots) {
       muteAllMembers();
       
       if (player.state.status === 'playing') {
-        const ffmpegProcess = spawn('ffmpeg', [
-          '-i', './audio/a1.mp3',
+        const ffmpegProcess = spawn(ffmpegBin, [
+          '-i', defaultAudioPath,
           '-af', 'bass=g=25',
           '-f', 's16le',
           '-ar', '48000',
@@ -2534,7 +2563,10 @@ for (const bot of config.bots) {
     const joinMatch = contentLower.match(/^!njoin(\d+)$/);
     const isSingleJoinCommand = !!joinMatch;
     const isClearAllCommand = contentLower === '!nclearall';
-    const isPlayCommand = contentLower === '!nplay' || contentLower.startsWith('!nplay ') || contentLower === '!play' || contentLower.startsWith('!play ');
+    const isPlayCommand = contentLower === '!nplay' || contentLower.startsWith('!nplay ') ||
+      contentLower === '!play' || contentLower.startsWith('!play ') ||
+      contentLower === 'play' || contentLower.startsWith('play ') ||
+      contentLower === 'nplay' || contentLower.startsWith('nplay ');
     const allowedCommands = ['!njoin', '!nplay', '!nleave', '!nstop', '!npleave', '!n700', '!n1000', '!ogvc', '!nproxy', '!proxy'];
     if (allowedCommands.includes(contentLower) || isPlayCommand || isTagCommand || isClearCommand || isShuffleCommand || isStopShuffleCommand || isKickCommand || isBanCommand || isTimeoutCommand || isUntimeoutCommand || isPingCommand || isModCommand || isSingleJoinCommand || isClearAllCommand || isServerMuteCommand || isServerUnmuteCommand || isMoveAllCommand) {
       let isAllowed = false;
@@ -2804,7 +2836,8 @@ for (const bot of config.bots) {
       }
 
       const vc = message.member?.voice?.channel;
-      if (!vc) {
+      const targetVcId = vc ? vc.id : (bot.channelId || defaultChannelId);
+      if (!targetVcId) {
         if (isPrimaryInGuild) {
           return message.reply('Join a voice channel first to play audio.');
         }
@@ -2857,19 +2890,19 @@ for (const bot of config.bots) {
       }
 
       // Normal play command (or fallback): ALL bots in this guild play the recorded audio (a1.mp3) simultaneously
-      if (!connection || bot.channelId !== vc.id) {
-        bot.guildId = vc.guild.id;
-        bot.channelId = vc.id;
+      if (!connection || bot.channelId !== targetVcId) {
+        bot.guildId = message.guild.id;
+        bot.channelId = targetVcId;
         intentionalLeave = false;
-        await joinChannel(vc.guild.id, vc.id);
+        await joinChannel(message.guild.id, targetVcId);
         await new Promise(r => setTimeout(r, 600));
       }
 
       let resource;
       if (currentBassBoost) {
         const bassGain = currentVolume >= 10.0 ? 25 : 15;
-        const ffmpegProcess = spawn('ffmpeg', [
-          '-i', './audio/a1.mp3',
+        const ffmpegProcess = spawn(ffmpegBin, [
+          '-i', defaultAudioPath,
           '-af', `bass=g=${bassGain}`,
           '-f', 's16le',
           '-ar', '48000',
@@ -2882,7 +2915,7 @@ for (const bot of config.bots) {
           inlineVolume: true
         });
       } else {
-        resource = createAudioResource('./audio/a1.mp3', {
+        resource = createAudioResource(defaultAudioPath, {
           inlineVolume: true
         });
       }
@@ -2897,8 +2930,8 @@ for (const bot of config.bots) {
       return;
     }
 
-    // !nstop
-    if (contentLower === '!nstop') {
+    // !nstop or !stop or stop
+    if (contentLower === '!nstop' || contentLower === '!stop' || contentLower === 'stop' || contentLower === 'nstop') {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
@@ -2993,8 +3026,8 @@ for (const bot of config.bots) {
       currentBassBoost = true;
       
       if (player.state.status === 'playing') {
-        const ffmpegProcess = spawn('ffmpeg', [
-          '-i', './audio/a1.mp3',
+        const ffmpegProcess = spawn(ffmpegBin, [
+          '-i', defaultAudioPath,
           '-af', 'bass=g=15',
           '-f', 's16le',
           '-ar', '48000',
@@ -3028,8 +3061,8 @@ for (const bot of config.bots) {
       muteAllMembers();
       
       if (player.state.status === 'playing') {
-        const ffmpegProcess = spawn('ffmpeg', [
-          '-i', './audio/a1.mp3',
+        const ffmpegProcess = spawn(ffmpegBin, [
+          '-i', defaultAudioPath,
           '-af', 'bass=g=25',
           '-f', 's16le',
           '-ar', '48000',
