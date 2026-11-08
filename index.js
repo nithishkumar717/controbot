@@ -796,6 +796,119 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception thrown:', err);
 });
 
+// Guild-level audio managers: a single shared AudioPlayer per guild for perfectly synchronized, ultra-lightweight multi-bot playback
+const guildAudioManagers = new Map();
+
+function getGuildAudioManager(guildId) {
+  if (!guildAudioManagers.has(guildId)) {
+    const player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play,
+      },
+    });
+
+    player.on('stateChange', (oldState, newState) => {
+      if (newState.status === 'idle') {
+        const mgr = guildAudioManagers.get(guildId);
+        if (mgr?.isMutingEveryone) {
+          mgr.isMutingEveryone = false;
+          unmuteAllGuildMembers(guildId);
+        }
+      }
+    });
+
+    player.on('error', (err) => {
+      console.warn(`[GuildAudioPlayer ${guildId}] Playback notice: ${err.message}`);
+    });
+
+    guildAudioManagers.set(guildId, {
+      player,
+      currentVolume: 1.0,
+      currentBassBoost: false,
+      isMutingEveryone: false,
+    });
+  }
+  return guildAudioManagers.get(guildId);
+}
+
+function playGuildAudio(guildId, options = {}) {
+  const mgr = getGuildAudioManager(guildId);
+  if (!mgr) return;
+
+  if (options.volume !== undefined) mgr.currentVolume = options.volume;
+  if (options.bassBoost !== undefined) mgr.currentBassBoost = options.bassBoost;
+
+  let resource;
+  if (mgr.currentBassBoost) {
+    const bassGain = mgr.currentVolume >= 10.0 ? 25 : 15;
+    const ffmpegProcess = spawn(ffmpegBin, [
+      '-i', defaultAudioPath,
+      '-af', `bass=g=${bassGain}`,
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1'
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+
+    resource = createAudioResource(ffmpegProcess.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true
+    });
+  } else {
+    resource = createAudioResource(defaultAudioPath, {
+      inlineVolume: true
+    });
+  }
+
+  resource.volume.setVolume(mgr.currentVolume);
+  mgr.player.play(resource);
+}
+
+function stopGuildAudio(guildId) {
+  const mgr = guildAudioManagers.get(guildId);
+  if (mgr) {
+    mgr.isMutingEveryone = false;
+    mgr.player.stop();
+    unmuteAllGuildMembers(guildId);
+  }
+}
+
+async function muteAllGuildMembers(guildId, channelId) {
+  const botsInGuild = activeBots.filter(b => b.configuredGuildId === guildId || b.client?.guilds?.cache?.has(guildId));
+  const masterBot = botsInGuild[0];
+  if (!masterBot) return;
+  try {
+    const guild = masterBot.client.guilds.cache.get(guildId);
+    const channel = guild?.channels.cache.get(channelId);
+    if (!channel) return;
+    for (const [memberId, member] of channel.members) {
+      if (botsInGuild.some(b => b.client.user.id === memberId)) continue;
+      if (!member.voice.mute) {
+        try { await member.voice.setMute(true, 'Bot dominating VC'); } catch {}
+      }
+    }
+  } catch {}
+}
+
+async function unmuteAllGuildMembers(guildId, channelId = null) {
+  const botsInGuild = activeBots.filter(b => b.configuredGuildId === guildId || b.client?.guilds?.cache?.has(guildId));
+  const masterBot = botsInGuild[0];
+  if (!masterBot) return;
+  try {
+    const guild = masterBot.client.guilds.cache.get(guildId);
+    if (!guild) return;
+    const channels = channelId ? [guild.channels.cache.get(channelId)].filter(Boolean) : Array.from(guild.channels.cache.values()).filter(c => c.isVoiceBased?.() || c.type === 2);
+    for (const ch of channels) {
+      for (const [memberId, member] of ch.members) {
+        if (botsInGuild.some(b => b.client.user.id === memberId)) continue;
+        if (member.voice.mute) {
+          try { await member.voice.setMute(false, 'Bot domination ended'); } catch {}
+        }
+      }
+    }
+  } catch {}
+}
+
 let activeIndex = 0;
 
 for (const bot of config.bots) {
@@ -823,60 +936,6 @@ for (const bot of config.bots) {
   let connectionTimeout = null;
   let intentionalLeave = false;
   let isJoining = false;
-  let currentVolume = 1.0;
-  let currentBassBoost = false;
-  let isMutingEveryone = false;
-
-  const player = createAudioPlayer({
-    behaviors: {
-      noSubscriber: NoSubscriberBehavior.Play,
-    },
-  });
-
-  player.on('stateChange', (oldState, newState) => {
-    if (newState.status === 'idle') {
-      if (isMutingEveryone) {
-        isMutingEveryone = false;
-        unmuteAllMembers();
-      }
-    }
-  });
-
-  const muteAllMembers = async () => {
-    if (!connection || !bot.guildId || !bot.channelId) return;
-    try {
-      const guild = client.guilds.cache.get(bot.guildId);
-      const channel = guild?.channels.cache.get(bot.channelId);
-      if (!channel) return;
-
-      for (const [memberId, member] of channel.members) {
-        if (memberId === client.user.id) continue;
-        if (!member.voice.mute) {
-          try {
-            await member.voice.setMute(true, 'Bot dominating VC');
-          } catch (err) {}
-        }
-      }
-    } catch (e) {}
-  };
-
-  const unmuteAllMembers = async () => {
-    if (!connection || !bot.guildId || !bot.channelId) return;
-    try {
-      const guild = client.guilds.cache.get(bot.guildId);
-      const channel = guild?.channels.cache.get(bot.channelId);
-      if (!channel) return;
-
-      for (const [memberId, member] of channel.members) {
-        if (memberId === client.user.id) continue;
-        if (member.voice.mute) {
-          try {
-            await member.voice.setMute(false, 'Bot domination ended');
-          } catch (err) {}
-        }
-      }
-    } catch (e) {}
-  };
 
   // Main voice channel join logic
   const joinChannel = async (guildId, channelId) => {
@@ -922,7 +981,8 @@ for (const bot of config.bots) {
         group: client.user.id,
       });
 
-      connection.subscribe(player);
+      const guildAudio = getGuildAudioManager(guild.id);
+      connection.subscribe(guildAudio.player);
 
       // Start watchdog timer (45 seconds) to handle genuinely stuck handshakes
       connectionTimeout = setTimeout(() => {
@@ -971,6 +1031,10 @@ for (const bot of config.bots) {
             bot._hasConnectedVoice = true;
             console.log(`[${client.user.tag}] Connected to voice: ${guild.name} -> ${channel.name}`);
           }
+          try {
+            const guildAudio = getGuildAudioManager(guild.id);
+            connection.subscribe(guildAudio.player);
+          } catch {}
         }
 
         if (newState.status === VoiceConnectionStatus.Destroyed) {
@@ -1104,7 +1168,9 @@ for (const bot of config.bots) {
       index: currentActiveIndex,
       client: client,
       configuredGuildId: defaultGuildId,
-      bot: bot
+      bot: bot,
+      joinChannel: (gid, cid) => joinChannel(gid, cid),
+      getConnection: () => connection,
     });
     proxyManager.setActiveBots(activeBots);
 
@@ -1612,7 +1678,8 @@ for (const bot of config.bots) {
     if (bot.guildId && newState.guild.id !== bot.guildId) return;
 
     if (newState.member.id !== client.user.id) {
-      if (isMutingEveryone && newState.channelId === bot.channelId) {
+      const mgr = getGuildAudioManager(newState.guild.id);
+      if (mgr.isMutingEveryone && newState.channelId === bot.channelId) {
         if (!newState.mute) {
           try {
             await newState.setMute(true, 'Bot dominating VC');
@@ -1626,7 +1693,6 @@ for (const bot of config.bots) {
       if (bot._hasConnectedVoice) {
         bot._hasConnectedVoice = false;
       }
-      player.stop();
       if (!intentionalLeave) {
         // If connection is already destroyed or lost, trigger reconnect immediately for 24/7 uptime
         if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) {
@@ -1773,84 +1839,42 @@ for (const bot of config.bots) {
         return interaction.reply({ content: 'Join a voice channel first to play audio.', ephemeral: true });
       }
 
-      if (!connection || bot.channelId !== targetVcId) {
-        bot.guildId = interaction.guild.id;
-        bot.channelId = targetVcId;
-        intentionalLeave = false;
-        await joinChannel(interaction.guild.id, targetVcId);
-        await new Promise(r => setTimeout(r, 600));
+      // Ensure all bots in this guild join the voice channel
+      const guildBots = activeBots.filter(b => b.configuredGuildId === interaction.guildId || b.client?.guilds?.cache?.has(interaction.guildId));
+      for (const b of guildBots) {
+        if (b.bot.channelId !== targetVcId) {
+          b.bot.guildId = interaction.guildId;
+          b.bot.channelId = targetVcId;
+          b.joinChannel(interaction.guildId, targetVcId);
+        }
       }
 
-      let resource;
-      if (currentBassBoost) {
-        const bassGain = currentVolume >= 10.0 ? 25 : 15;
-        const ffmpegProcess = spawn(ffmpegBin, [
-          '-i', defaultAudioPath,
-          '-af', `bass=g=${bassGain}`,
-          '-f', 's16le',
-          '-ar', '48000',
-          '-ac', '2',
-          'pipe:1'
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const mgr = getGuildAudioManager(interaction.guildId);
+      playGuildAudio(interaction.guildId, { volume: mgr.currentVolume, bassBoost: mgr.currentBassBoost });
 
-        resource = createAudioResource(ffmpegProcess.stdout, {
-          inputType: StreamType.Raw,
-          inlineVolume: true
-        });
-      } else {
-        resource = createAudioResource(defaultAudioPath, {
-          inlineVolume: true
-        });
-      }
-
-      resource.volume.setVolume(currentVolume);
-      player.play(resource);
-
-      return interaction.reply({ content: `Playing recorded audio (Volume: ${currentVolume * 100}%, Bass Boost: ${currentBassBoost ? 'ON' : 'OFF'}).` });
+      return interaction.reply({ content: `Playing recorded audio across ${guildBots.length || 1} bot(s) in sync (Volume: ${mgr.currentVolume * 100}%, Bass Boost: ${mgr.currentBassBoost ? 'ON' : 'OFF'}).` });
     }
 
     else if (commandName === 'nstop') {
-      isMutingEveryone = false;
-      unmuteAllMembers();
-      player.stop();
-      return interaction.reply({ content: 'Stopped audio playback.' });
+      stopGuildAudio(interaction.guildId);
+      return interaction.reply({ content: 'Stopped audio playback across all bots.' });
     }
 
     else if (commandName === 'nleave' || commandName === 'ogvc') {
-      isMutingEveryone = false;
-      unmuteAllMembers();
-      player.stop();
-      if (!connection) {
-        bot.guildId = defaultGuildId;
-        bot.channelId = defaultChannelId;
-        intentionalLeave = false;
-        joinChannel(defaultGuildId, defaultChannelId);
-        return interaction.reply({ content: 'Connecting to the original voice channel.' });
+      stopGuildAudio(interaction.guildId);
+
+      const guildBots = activeBots.filter(b => b.configuredGuildId === interaction.guildId || b.client?.guilds?.cache?.has(interaction.guildId));
+      for (const b of guildBots) {
+        b.bot.guildId = b.configuredGuildId;
+        b.bot.channelId = b.bot.channelId || defaultChannelId;
+        b.joinChannel(b.configuredGuildId, b.bot.channelId);
       }
 
-      bot.guildId = defaultGuildId;
-      bot.channelId = defaultChannelId;
-      intentionalLeave = false;
-
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-        reconnectTimeout = null;
-      }
-      if (connectionTimeout) {
-        clearTimeout(connectionTimeout);
-        connectionTimeout = null;
-      }
-
-      joinChannel(defaultGuildId, defaultChannelId);
-      return interaction.reply({ content: 'Returning to the original voice channel.' });
+      return interaction.reply({ content: 'Returning bots to the original voice channel.' });
     }
 
     else if (commandName === 'npleave') {
       intentionalLeave = true;
-      isMutingEveryone = false;
-      unmuteAllMembers();
-      player.stop();
-
       if (reconnectTimeout) {
         clearTimeout(reconnectTimeout);
         reconnectTimeout = null;
@@ -1865,58 +1889,34 @@ for (const bot of config.bots) {
         connection = null;
       }
 
+      stopGuildAudio(interaction.guildId);
       return interaction.reply({ content: 'Left the voice channel permanently.' });
     }
 
     else if (commandName === 'n700') {
-      currentVolume = 7.0;
-      currentBassBoost = true;
+      const mgr = getGuildAudioManager(interaction.guildId);
+      mgr.currentVolume = 7.0;
+      mgr.currentBassBoost = true;
       
-      if (player.state.status === 'playing') {
-        const ffmpegProcess = spawn(ffmpegBin, [
-          '-i', defaultAudioPath,
-          '-af', 'bass=g=15',
-          '-f', 's16le',
-          '-ar', '48000',
-          '-ac', '2',
-          'pipe:1'
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-        const resource = createAudioResource(ffmpegProcess.stdout, {
-          inputType: StreamType.Raw,
-          inlineVolume: true
-        });
-        resource.volume.setVolume(7.0);
-        player.play(resource);
-        return interaction.reply({ content: 'Volume boosted to 700% and Bass Boost enabled.' });
+      if (mgr.player.state.status === 'playing') {
+        playGuildAudio(interaction.guildId, { volume: 7.0, bassBoost: true });
+        return interaction.reply({ content: 'Volume boosted to 700% and Bass Boost enabled across all bots.' });
       }
       
       return interaction.reply({ content: 'Volume boosted to 700% and Bass Boost enabled for next playback.' });
     }
 
     else if (commandName === 'n1000') {
-      currentVolume = 10.0;
-      currentBassBoost = true;
-      isMutingEveryone = true;
-      muteAllMembers();
+      const mgr = getGuildAudioManager(interaction.guildId);
+      mgr.currentVolume = 10.0;
+      mgr.currentBassBoost = true;
+      mgr.isMutingEveryone = true;
+      const vc = interaction.member?.voice?.channel;
+      if (vc) muteAllGuildMembers(interaction.guildId, vc.id);
       
-      if (player.state.status === 'playing') {
-        const ffmpegProcess = spawn(ffmpegBin, [
-          '-i', defaultAudioPath,
-          '-af', 'bass=g=25',
-          '-f', 's16le',
-          '-ar', '48000',
-          '-ac', '2',
-          'pipe:1'
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-        const resource = createAudioResource(ffmpegProcess.stdout, {
-          inputType: StreamType.Raw,
-          inlineVolume: true
-        });
-        resource.volume.setVolume(10.0);
-        player.play(resource);
-        return interaction.reply({ content: 'Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.' });
+      if (mgr.player.state.status === 'playing') {
+        playGuildAudio(interaction.guildId, { volume: 10.0, bassBoost: true });
+        return interaction.reply({ content: 'Volume boosted to 1000%, Bass Boost set to MAX, and VC muted across all bots.' });
       }
       
       return interaction.reply({ content: 'Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.' });
@@ -2997,90 +2997,42 @@ for (const bot of config.bots) {
         return;
       }
 
-      // Normal play command: ALL bots in this guild play the recorded audio (a1.mp3) simultaneously
+      // Normal play command: ALL bots in this guild join VC if not already connected
       if (!connection || bot.channelId !== targetVcId) {
         bot.guildId = message.guild.id;
         bot.channelId = targetVcId;
         intentionalLeave = false;
         await joinChannel(message.guild.id, targetVcId);
-        await new Promise(r => setTimeout(r, 600));
       }
 
-      let resource;
-      if (currentBassBoost) {
-        const bassGain = currentVolume >= 10.0 ? 25 : 15;
-        const ffmpegProcess = spawn(ffmpegBin, [
-          '-i', defaultAudioPath,
-          '-af', `bass=g=${bassGain}`,
-          '-f', 's16le',
-          '-ar', '48000',
-          '-ac', '2',
-          'pipe:1'
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-        resource = createAudioResource(ffmpegProcess.stdout, {
-          inputType: StreamType.Raw,
-          inlineVolume: true
-        });
-      } else {
-        resource = createAudioResource(defaultAudioPath, {
-          inlineVolume: true
-        });
-      }
-
-      resource.volume.setVolume(currentVolume);
-      player.play(resource);
-
+      // The primary responder triggers shared playback ONCE for all bots in this guild
       if (isPrimaryInGuild) {
-        return message.reply(`Playing recorded audio (Volume: ${currentVolume * 100}%, Bass Boost: ${currentBassBoost ? 'ON' : 'OFF'}).`);
+        const mgr = getGuildAudioManager(message.guild.id);
+        playGuildAudio(message.guild.id, { volume: mgr.currentVolume, bassBoost: mgr.currentBassBoost });
+        return message.reply(`Playing recorded audio across bots in sync (Volume: ${mgr.currentVolume * 100}%, Bass Boost: ${mgr.currentBassBoost ? 'ON' : 'OFF'}).`);
       }
       return;
     }
 
     // !nstop or !stop or stop
     if (contentLower === '!nstop' || contentLower === '!stop' || contentLower === 'stop' || contentLower === 'nstop') {
-      isMutingEveryone = false;
-      unmuteAllMembers();
-      player.stop();
       if (isPrimaryInGuild) {
-        return message.reply('Stopped audio playback.');
+        stopGuildAudio(message.guild.id);
+        return message.reply('Stopped audio playback across all bots.');
       }
       return;
     }
 
     // !nleave or !ogvc
     if (contentLower === '!nleave' || contentLower === '!ogvc') {
-      isMutingEveryone = false;
-      unmuteAllMembers();
-      player.stop();
-      if (!connection) {
-        // If not connected, join the original channel anyway
-        bot.guildId = defaultGuildId;
-        bot.channelId = defaultChannelId;
-        intentionalLeave = false;
-        joinChannel(defaultGuildId, defaultChannelId);
-        if (isPrimaryInGuild) {
-          return message.reply('Connecting to the original voice channel.');
-        }
-        return;
-      }
-
       bot.guildId = defaultGuildId;
       bot.channelId = defaultChannelId;
       intentionalLeave = false;
-
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-        reconnectTimeout = null;
-      }
-      if (connectionTimeout) {
-        clearTimeout(connectionTimeout);
-        connectionTimeout = null;
-      }
-
       joinChannel(defaultGuildId, defaultChannelId);
+
       if (isPrimaryInGuild) {
-        return message.reply('Returning to the original voice channel.');
+        stopGuildAudio(message.guild.id);
+        return message.reply('Returning bots to the original voice channel.');
       }
       return;
     }
@@ -3088,10 +3040,6 @@ for (const bot of config.bots) {
     // !npleave
     if (contentLower === '!npleave') {
       intentionalLeave = true;
-      isMutingEveryone = false;
-      unmuteAllMembers();
-      player.stop();
-
       if (reconnectTimeout) {
         clearTimeout(reconnectTimeout);
         reconnectTimeout = null;
@@ -3107,6 +3055,7 @@ for (const bot of config.bots) {
       }
 
       if (isPrimaryInGuild) {
+        stopGuildAudio(message.guild.id);
         return message.reply('Left the voice channel permanently.');
       }
       return;
@@ -3114,32 +3063,15 @@ for (const bot of config.bots) {
 
     // !n700
     if (contentLower === '!n700') {
-      currentVolume = 7.0;
-      currentBassBoost = true;
-      
-      if (player.state.status === 'playing') {
-        const ffmpegProcess = spawn(ffmpegBin, [
-          '-i', defaultAudioPath,
-          '-af', 'bass=g=15',
-          '-f', 's16le',
-          '-ar', '48000',
-          '-ac', '2',
-          'pipe:1'
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-        const resource = createAudioResource(ffmpegProcess.stdout, {
-          inputType: StreamType.Raw,
-          inlineVolume: true
-        });
-        resource.volume.setVolume(7.0);
-        player.play(resource);
-        if (isPrimaryInGuild) {
-          return message.reply('Volume boosted to 700% and Bass Boost enabled.');
-        }
-        return;
-      }
+      const mgr = getGuildAudioManager(message.guild.id);
+      mgr.currentVolume = 7.0;
+      mgr.currentBassBoost = true;
       
       if (isPrimaryInGuild) {
+        if (mgr.player.state.status === 'playing') {
+          playGuildAudio(message.guild.id, { volume: 7.0, bassBoost: true });
+          return message.reply('Volume boosted to 700% and Bass Boost enabled across all bots.');
+        }
         return message.reply('Volume boosted to 700% and Bass Boost enabled for next playback.');
       }
       return;
@@ -3147,34 +3079,18 @@ for (const bot of config.bots) {
 
     // !n1000
     if (contentLower === '!n1000') {
-      currentVolume = 10.0;
-      currentBassBoost = true;
-      isMutingEveryone = true;
-      muteAllMembers();
-      
-      if (player.state.status === 'playing') {
-        const ffmpegProcess = spawn(ffmpegBin, [
-          '-i', defaultAudioPath,
-          '-af', 'bass=g=25',
-          '-f', 's16le',
-          '-ar', '48000',
-          '-ac', '2',
-          'pipe:1'
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-        const resource = createAudioResource(ffmpegProcess.stdout, {
-          inputType: StreamType.Raw,
-          inlineVolume: true
-        });
-        resource.volume.setVolume(10.0);
-        player.play(resource);
-        if (isPrimaryInGuild) {
-          return message.reply('Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.');
-        }
-        return;
-      }
+      const mgr = getGuildAudioManager(message.guild.id);
+      mgr.currentVolume = 10.0;
+      mgr.currentBassBoost = true;
+      mgr.isMutingEveryone = true;
+      const vc = message.member?.voice?.channel;
+      if (vc) muteAllGuildMembers(message.guild.id, vc.id);
       
       if (isPrimaryInGuild) {
+        if (mgr.player.state.status === 'playing') {
+          playGuildAudio(message.guild.id, { volume: 10.0, bassBoost: true });
+          return message.reply('Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.');
+        }
         return message.reply('Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.');
       }
       return;
