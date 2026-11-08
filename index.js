@@ -589,7 +589,43 @@ async function sendAnimatedHelp(target, guild, clientUser) {
       await msg.edit({ embeds: [frame3] });
     }
   } catch (err) {
-    console.error('Failed to send animated help menu:', err);
+    console.error('Failed to send animated help menu:', err?.message || err);
+    const plainTextHelp = `✨ **COMMAND CATALOG** ✨\n\n` +
+      `**🔊 VOICE & MUSIC**\n` +
+      `• \`!join\` / \`!join[num]\` : Join your voice channel (e.g. \`!join25\`)\n` +
+      `• \`!play\` [song query] / \`!stop\` : Play audio / song or stop playback\n` +
+      `• \`!leave\` : Return to the configured voice channel\n` +
+      `• \`!pleave\` : Disconnect from voice\n` +
+      `• \`!700\` / \`!1000\` : Set boosted playback volume\n\n` +
+      `**🛡️ MANAGEMENT & UTILITY**\n` +
+      `• \`!wl [add|remove|list] @member\` : Manage this server's whitelist\n` +
+      `• \`!clear [count]\` / \`!clearall\` : Clear messages\n` +
+      `• \`!kick @member\` / \`!ban @member\` : Moderate members\n` +
+      `• \`!timeout @member [minutes]\` / \`!untimeout @member\`\n` +
+      `• \`!servermute @member\` / \`!serverunmute @member\`\n` +
+      `• \`!moveall [voice channel]\` : Move voice channel members\n` +
+      `• \`!nick [new name]\` / \`!nick reset\` : Set or reset server nickname\n` +
+      `• \`!avatar\` + image / \`!avatar reset\` : Set or reset bot avatar\n` +
+      `• \`!mimic [icon|nick|all]\` : Copy server icon and/or name to bot\n` +
+      `• \`!ping\` / \`!mod\` : Latency and moderation lists\n\n` +
+      `**🔥 TROLL & FUN**\n` +
+      `• \`!tag @member [count] [message]\` : Repeat a tag\n` +
+      `• \`!shuffle\` : Shuffle members from your voice channel\n` +
+      `• \`!shuffle loop\` / \`!stopshuffle\` : Start or stop repeated shuffling`;
+
+    try {
+      if (isSlash) {
+        if (target.replied || target.deferred) {
+          await target.editReply({ content: plainTextHelp, embeds: [] });
+        } else {
+          await target.reply({ content: plainTextHelp, ephemeral: true });
+        }
+      } else {
+        await target.reply(plainTextHelp);
+      }
+    } catch (fallbackErr) {
+      console.error('Failed to send fallback plain text help:', fallbackErr?.message || fallbackErr);
+    }
   }
 }
 
@@ -1064,8 +1100,12 @@ for (const bot of config.bots) {
           description: 'Boosts the volume to 1000% and enables MAX Bass Boost'
         },
         {
+          name: 'help',
+          description: 'Shows the command catalog and help message'
+        },
+        {
           name: 'nhelp',
-          description: 'Shows the help message'
+          description: 'Shows the command catalog and help message'
         },
         {
           name: 'whitelist',
@@ -1463,7 +1503,7 @@ for (const bot of config.bots) {
 
     const commandName = interaction.commandName;
     const allSlashCommands = [
-      'tag', 'clear', 'njoin', 'nplay', 'nleave', 'nstop', 'npleave', 'n700', 'n1000', 'ogvc', 'nhelp', 'whitelist', '1wl',
+      'tag', 'clear', 'njoin', 'nplay', 'nleave', 'nstop', 'npleave', 'n700', 'n1000', 'ogvc', 'help', 'nhelp', 'whitelist', '1wl',
       'nshuffle', 'nstopshuffle', 'shuffle', 'stopshuffle',
       'wllist',
       'nkick', 'kick', 'nban', 'ban', 'ntimeout', 'timeout', 'nuntimeout', 'untimeout',
@@ -1497,8 +1537,8 @@ for (const bot of config.bots) {
       }
     }
 
-    // Allow anyone to play the playgame minigame
-    if (commandName === 'playgame') {
+    // Allow anyone to use help or playgame
+    if (commandName === 'help' || commandName === 'nhelp' || commandName === 'playgame') {
       isAllowed = true;
     }
 
@@ -1799,7 +1839,7 @@ for (const bot of config.bots) {
       return interaction.reply({ content: 'Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.' });
     }
 
-    else if (commandName === 'nhelp') {
+    else if (commandName === 'nhelp' || commandName === 'help') {
       return sendAnimatedHelp(interaction, interaction.guild, client.user);
     }
 
@@ -2467,6 +2507,17 @@ for (const bot of config.bots) {
 
     const normalizedContent = normalizePrefixCommand(message.content);
     const contentLower = normalizedContent.toLowerCase();
+
+    // Help command: publicly available to all users (supports !help, !nhelp, help, nhelp)
+    const isHelpCommand = contentLower === '!nhelp' || contentLower.startsWith('!nhelp ') ||
+      contentLower === '!help' || contentLower.startsWith('!help ') ||
+      contentLower === 'help' || contentLower === 'nhelp';
+
+    if (isHelpCommand) {
+      if (!isPrimaryInGuild) return;
+      return sendAnimatedHelp(message, message.guild, client.user);
+    }
+
     const isTagCommand = contentLower.startsWith('!ntag');
     const isClearCommand = contentLower === '!nclear' || contentLower.startsWith('!nclear ');
     const isShuffleCommand = contentLower.startsWith('!nshuffle') || contentLower.startsWith('!shuffle') || contentLower.startsWith('shuffle') || contentLower.startsWith('nshuffle');
@@ -2484,7 +2535,7 @@ for (const bot of config.bots) {
     const isSingleJoinCommand = !!joinMatch;
     const isClearAllCommand = contentLower === '!nclearall';
     const isPlayCommand = contentLower === '!nplay' || contentLower.startsWith('!nplay ') || contentLower === '!play' || contentLower.startsWith('!play ');
-    const allowedCommands = ['!njoin', '!nplay', '!nleave', '!nstop', '!npleave', '!nhelp', '!n700', '!n1000', '!ogvc', '!nproxy', '!proxy'];
+    const allowedCommands = ['!njoin', '!nplay', '!nleave', '!nstop', '!npleave', '!n700', '!n1000', '!ogvc', '!nproxy', '!proxy'];
     if (allowedCommands.includes(contentLower) || isPlayCommand || isTagCommand || isClearCommand || isShuffleCommand || isStopShuffleCommand || isKickCommand || isBanCommand || isTimeoutCommand || isUntimeoutCommand || isPingCommand || isModCommand || isSingleJoinCommand || isClearAllCommand || isServerMuteCommand || isServerUnmuteCommand || isMoveAllCommand) {
       let isAllowed = false;
 
@@ -3330,23 +3381,6 @@ for (const bot of config.bots) {
       } else {
         return statusMsg.edit(`❌ Failed to move members: ${result.error}`);
       }
-    }
-
-    // !nhelp
-    if (contentLower === '!nhelp') {
-      // Coordinate to ensure only one "master" bot instance replies in the guild channel
-      if (message.guild) {
-        const botsInGuild = activeBots.filter(b => b.configuredGuildId === message.guild.id);
-        if (botsInGuild.length > 1) {
-          botsInGuild.sort((a, b) => a.index - b.index);
-          const masterBot = botsInGuild[0];
-          if (masterBot.index !== currentActiveIndex) {
-            return; // Ignore the command, let the master bot handle it
-          }
-        }
-      }
-
-      return sendAnimatedHelp(message, message.guild, client.user);
     }
   });
 
