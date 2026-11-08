@@ -194,9 +194,9 @@ module.exports = {
   ],
 
   lavalink: {
-    host: process.env.LAVALINK_HOST || '193.226.78.187',
-    port: parseInt(process.env.LAVALINK_PORT || '4998', 10),
-    password: process.env.LAVALINK_PASSWORD || 'ryugalavalink',
+    host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
+    port: parseInt(process.env.LAVALINK_PORT || '13592', 10),
+    password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
     secure: process.env.LAVALINK_SECURE === 'true'
   }
 };
