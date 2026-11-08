@@ -683,10 +683,14 @@ for (const bot of config.bots) {
     if (currentActiveIndex === 0) console.log(`[Lavalink] Node reconnecting: ${node.name}`);
   });
   poru.on('trackStart', (p, track) => {
+    const botsInGuild = activeBots.filter(b => b.configuredGuildId === p.guildId).sort((a, b) => a.index - b.index);
+    if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
     const ch = client.channels.cache.get(p.textChannel);
     if (ch) ch.send(`🎵 Now playing: **${track.info.title}** by **${track.info.author}**`).catch(() => {});
   });
   poru.on('queueEnd', (p) => {
+    const botsInGuild = activeBots.filter(b => b.configuredGuildId === p.guildId).sort((a, b) => a.index - b.index);
+    if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
     const ch = client.channels.cache.get(p.textChannel);
     if (ch) ch.send('🏁 Song queue ended.').catch(() => {});
   });
@@ -2724,19 +2728,9 @@ for (const bot of config.bots) {
         return;
       }
 
-      // If a song query is provided, play via Lavalink (single-bot queue/playback)
+      // If a song query is provided, play via Lavalink across all bots in this guild
       const hasConnectedNode = poru && Array.from(poru.nodes.values()).some(n => n.isConnected);
       if (query && hasConnectedNode) {
-        const botInVc = botsInThisGuild.find(b => {
-          const memberMe = b.client.guilds.cache.get(message.guild.id)?.members.me;
-          return memberMe?.voice?.channelId && memberMe.voice.channelId === vc.id;
-        });
-
-        const targetBot = botInVc || botsInThisGuild[0];
-        if (targetBot && targetBot.index !== currentActiveIndex) {
-          return;
-        }
-
         try {
           if (player.state.status === 'playing') {
             player.stop();
@@ -2753,7 +2747,10 @@ for (const bot of config.bots) {
           const res = await poru.resolve({ query, source: resolveSource, requester: message.author });
 
           if (!res || res.loadType === 'error' || res.loadType === 'empty' || !res.tracks?.length) {
-            return message.reply(`❌ No results found for \`${query}\`.`);
+            if (isPrimaryInGuild) {
+              return message.reply(`❌ No results found for \`${query}\`.`);
+            }
+            return;
           }
 
           if (res.loadType === 'playlist') {
@@ -2761,16 +2758,25 @@ for (const bot of config.bots) {
               poruPlayer.queue.add(track);
             }
             if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
-            return message.reply(`🎶 Added playlist **${res.playlistInfo?.name || query}** (${res.tracks.length} tracks) to queue.`);
+            if (isPrimaryInGuild) {
+              return message.reply(`🎶 Added playlist **${res.playlistInfo?.name || query}** (${res.tracks.length} tracks) to queue.`);
+            }
+            return;
           } else {
             const track = res.tracks[0];
             poruPlayer.queue.add(track);
             if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
-            return message.reply(`🎵 Added to queue: **${track.info.title}** by **${track.info.author}**`);
+            if (isPrimaryInGuild) {
+              return message.reply(`🎵 Added to queue: **${track.info.title}** by **${track.info.author}**`);
+            }
+            return;
           }
         } catch (err) {
           console.error('[!nplay Lavalink Error]:', err);
-          return message.reply(`⚠️ Lavalink error: ${err.message || 'Unknown'}.`);
+          if (isPrimaryInGuild) {
+            return message.reply(`⚠️ Lavalink error: ${err.message || 'Unknown'}.`);
+          }
+          return;
         }
       }
 
