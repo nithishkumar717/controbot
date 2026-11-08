@@ -593,6 +593,10 @@ async function sendAnimatedHelp(target, guild, clientUser) {
 
 // Prevent global process crashes from unhandled rejections or uncaught exceptions
 process.on('unhandledRejection', (reason, promise) => {
+  const reasonStr = String(reason?.message || reason || '');
+  if (reasonStr.includes('Poru Websocket') || reasonStr.includes('ECONNREFUSED') || reasonStr.includes('socket closed') || reasonStr.includes('Cannot perform IP discovery')) {
+    return;
+  }
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
