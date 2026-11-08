@@ -543,7 +543,11 @@ async function sendAnimatedHelp(target, guild, clientUser) {
     if (isSlash) {
       await target.reply({ embeds: [loadEmbed] });
     } else {
-      msg = await target.reply({ embeds: [loadEmbed] });
+      try {
+        msg = await target.reply({ embeds: [loadEmbed] });
+      } catch (replyErr) {
+        msg = await target.channel.send({ embeds: [loadEmbed] });
+      }
     }
 
     // Wait for loading animation feel
@@ -625,7 +629,11 @@ async function sendAnimatedHelp(target, guild, clientUser) {
           await target.reply({ content: plainTextHelp, ephemeral: true });
         }
       } else {
-        await target.reply(plainTextHelp);
+        try {
+          await target.reply(plainTextHelp);
+        } catch {
+          await target.channel.send(plainTextHelp);
+        }
       }
     } catch (fallbackErr) {
       console.error('Failed to send fallback plain text help:', fallbackErr?.message || fallbackErr);
@@ -636,13 +644,17 @@ async function sendAnimatedHelp(target, guild, clientUser) {
 // Prevent global process crashes from unhandled rejections or uncaught exceptions
 process.on('unhandledRejection', (reason, promise) => {
   const reasonStr = String(reason?.message || reason || '');
-  if (reasonStr.includes('Poru Websocket') || reasonStr.includes('ECONNREFUSED') || reasonStr.includes('socket closed') || reasonStr.includes('Cannot perform IP discovery')) {
+  if (reasonStr.includes('Poru Websocket') || reasonStr.includes('ECONNREFUSED') || reasonStr.includes('socket closed') || reasonStr.includes('Cannot perform IP discovery') || reasonStr.includes('WrongEpoch')) {
     return;
   }
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 process.on('uncaughtException', (err) => {
+  const errStr = String(err?.message || err || '');
+  if (errStr.includes('WrongEpoch') || errStr.includes('DAVE') || errStr.includes('Failed to process proposals')) {
+    return;
+  }
   console.error('Uncaught Exception thrown:', err);
 });
 
