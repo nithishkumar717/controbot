@@ -39,7 +39,10 @@ function scheduleNextCheck(delay) {
 }
 
 function tryInitializeGitRepo() {
-  const remoteUrl = process.env.GIT_REPO_URL || process.env.GIT_REMOTE_URL || 'https://github.com/nithishkumar717/controbot.git';
+  const remoteUrl = process.env.GIT_REPO_URL || process.env.GIT_REMOTE_URL || '';
+  if (!remoteUrl) {
+    return false;
+  }
   try {
     console.log(`[git-watchdog] Missing .git folder; initializing repository linked to "${remoteName}/${branchName}"...`);
     runGit(['init']);
@@ -110,10 +113,12 @@ function checkForUpdates() {
     const dirtyTracked = runGit(['status', '--porcelain', '-uno']);
     if (dirtyTracked) {
       if (!wasDirty) {
-        console.warn('[git-watchdog] New commit available on GitHub, but local modifications exist on tracked files. Pausing pull to prevent overwriting local edits.');
+        console.warn('[git-watchdog] New commit available on remote. Resetting local modifications to apply clean update...');
       }
+      try {
+        runGit(['reset', '--hard', 'HEAD']);
+      } catch {}
       wasDirty = true;
-      return;
     }
     if (wasDirty) {
       console.log('[git-watchdog] Tracked files are clean; resuming auto-pull.');
@@ -122,7 +127,11 @@ function checkForUpdates() {
 
     // 4. Fast-forward pull the latest updates
     console.log(`[git-watchdog] Update detected (${remoteCommit.slice(0, 7)}). Pulling changes from ${remoteName}/${branchName}...`);
-    runGit(['pull', '--quiet', '--ff-only', remoteName, branchName]);
+    try {
+      runGit(['pull', '--quiet', '--ff-only', remoteName, branchName]);
+    } catch {
+      runGit(['reset', '--hard', `${remoteName}/${branchName}`]);
+    }
     const updatedCommit = runGit(['rev-parse', 'HEAD']);
 
     console.log(`[git-watchdog] Successfully updated from ${localCommit.slice(0, 7)} to ${updatedCommit.slice(0, 7)}.`);
@@ -175,17 +184,19 @@ function manualPull() {
       };
     }
 
-    // 2. Check for dirty tracked files
-    const dirtyTracked = runGit(['status', '--porcelain', '-uno']);
-    if (dirtyTracked) {
-      return {
-        success: false,
-        message: 'Cannot pull: local modifications exist on tracked files.'
-      };
+    // 2. Reset any dirty tracked files so pull never conflicts or blocks
+    try {
+      runGit(['reset', '--hard', 'HEAD']);
+    } catch (resetErr) {
+      console.warn('[git-watchdog] git reset note:', resetErr.message);
     }
 
-    // 3. Fast-forward pull
-    runGit(['pull', '--quiet', '--ff-only', remoteName, branchName]);
+    // 3. Fast-forward or pull latest remote commit
+    try {
+      runGit(['pull', '--quiet', remoteName, branchName]);
+    } catch {
+      runGit(['reset', '--hard', `${remoteName}/${branchName}`]);
+    }
     const updatedCommit = runGit(['rev-parse', 'HEAD']);
 
     console.log(`[git-watchdog] Manual pull completed: ${localCommit.slice(0, 7)} -> ${updatedCommit.slice(0, 7)}. Restarting process...`);
