@@ -14,6 +14,7 @@ const config = require('./config');
 const fs = require('fs');
 const path = require('path');
 const gitWatchdog = require('./git-watchdog');
+const proxyManager = require('./proxy-manager');
 
 // Load persistent whitelist
 const whitelistFilePath = path.join(__dirname, 'whitelist.json');
@@ -618,6 +619,9 @@ for (const bot of config.bots) {
     ],
   });
 
+  // Register client with proxy manager to auto-rotate proxy on rate limits
+  proxyManager.registerClient(client, currentActiveIndex);
+
   let connection = null;
   let reconnectTimeout = null;
   let connectionTimeout = null;
@@ -907,6 +911,7 @@ for (const bot of config.bots) {
           console.log(`[${client.user.tag}] Nickname set to "${bot.nickname || bot.nick}" in ${guild.name}.`);
         }
       } catch (nickErr) {
+        await proxyManager.handleRateLimit(nickErr, 'Startup nickname');
         console.warn(`[${client.user.tag}] Could not set nickname: ${nickErr.message}`);
       }
     }
@@ -920,6 +925,7 @@ for (const bot of config.bots) {
           await client.user.setAvatar(avatarBuf);
           console.log(`[${client.user.tag}] Avatar updated from ${avatarFile}.`);
         } catch (avatarErr) {
+          await proxyManager.handleRateLimit(avatarErr, 'Startup avatar');
           console.warn(`[${client.user.tag}] Could not set avatar: ${avatarErr.message}`);
         }
       } else {
@@ -934,6 +940,7 @@ for (const bot of config.bots) {
       configuredGuildId: defaultGuildId,
       bot: bot
     });
+    proxyManager.setActiveBots(activeBots);
 
     // Set bot presence to Playing status
     client.user.setPresence({
@@ -2103,6 +2110,12 @@ for (const bot of config.bots) {
 
     if (!message.guild || message.guild.id !== defaultGuildId) return;
 
+    // Active bots in this guild and primary bot determination
+    const botsInThisGuild = activeBots
+      .filter(b => b.configuredGuildId === message.guild.id)
+      .sort((a, b) => a.index - b.index);
+    const isPrimaryInGuild = botsInThisGuild.length === 0 || botsInThisGuild[0].index === currentActiveIndex;
+
     // Whitelist management commands (!wl, !whitelist, !unwl, etc.)
     const args = message.content.trim().split(/\s+/);
     const commandNameText = args[0].toLowerCase();
@@ -2201,16 +2214,11 @@ for (const bot of config.bots) {
 
     // Nickname management commands (!nick, !nickname, !nnick, etc.)
     if (['!nick', '!nnick', '!nickname', '!nnickname'].includes(commandNameText)) {
-      const botsInGuild = activeBots
-        .filter(activeBot => activeBot.configuredGuildId === message.guild.id)
-        .sort((a, b) => a.index - b.index);
-
       if (!isOwnerOrAdmin(message.author.id, message.guild.id, message.member, message.guild)) {
-        if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
+        if (!isPrimaryInGuild) return;
         return message.reply('You do not have permission to change this server profile.');
       }
 
-      const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
       if (!isPrimaryInGuild) return;
 
       const newNick = args.slice(1).join(' ').trim();
@@ -2221,51 +2229,37 @@ for (const bot of config.bots) {
           try {
             await message.guild.members.me.setNickname(null);
           } catch (nickErr) {
+            await proxyManager.handleRateLimit(nickErr, 'Reset nickname');
             console.warn(`[${client.user.tag}] setNickname error:`, nickErr.message);
           }
-          if (isPrimaryInGuild) {
-            return message.reply("Reset bot nickname in this server.");
-          }
-          return;
+          return message.reply("Reset bot nickname in this server.");
         }
 
         if (newNick.length > 32) {
-          if (isPrimaryInGuild) {
-            return message.reply('Nickname cannot exceed 32 characters.');
-          }
-          return;
+          return message.reply('Nickname cannot exceed 32 characters.');
         }
 
         try {
           await message.guild.members.me.setNickname(newNick);
         } catch (nickErr) {
+          await proxyManager.handleRateLimit(nickErr, 'Set nickname');
           console.warn(`[${client.user.tag}] setNickname error:`, nickErr.message);
         }
 
-        if (isPrimaryInGuild) {
-          return message.reply(`Updated server nickname to "${newNick}".`);
-        }
-        return;
+        return message.reply(`Updated server nickname to "${newNick}".`);
       } catch (err) {
-        if (isPrimaryInGuild) {
-          return message.reply(`Could not update server nickname: ${err.message}`);
-        }
-        return;
+        await proxyManager.handleRateLimit(err, 'Nickname command');
+        return message.reply(`Could not update server nickname: ${err.message}`);
       }
     }
 
     if (commandNameText === '!mimic' || commandNameText === '!nmimic') {
-      const botsInGuild = activeBots
-        .filter(activeBot => activeBot.configuredGuildId === message.guild.id)
-        .sort((a, b) => a.index - b.index);
-
       if (!isOwnerOrAdmin(message.author.id, message.guild.id, message.member, message.guild)) {
-        if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
+        if (!isPrimaryInGuild) return;
         return message.reply('You do not have permission to change this server profile.');
       }
 
       // Strictly execute ONLY on the bot designated for this server
-      const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
       if (!isPrimaryInGuild) return;
 
       let subArg = (args[1] || 'all').toLowerCase();
@@ -2291,6 +2285,7 @@ for (const bot of config.bots) {
             await message.guild.members.me.setNickname(serverNameNick);
             actionsPerformed.push(`server nickname to "${serverNameNick}"`);
           } catch (nickErr) {
+            await proxyManager.handleRateLimit(nickErr, 'Mimic nickname');
             console.warn(`[${client.user.tag}] mimic setNickname error:`, nickErr.message);
           }
         }
@@ -2319,7 +2314,8 @@ for (const bot of config.bots) {
               actionsPerformed.push("server icon to bot avatar");
             } catch (avatarErr) {
               if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
-                actionsPerformed.push("(avatar change rate-limited by Discord; try again in a few minutes)");
+                await proxyManager.rotateProxy('Discord avatar 429 rate limit');
+                actionsPerformed.push("(avatar rate-limited; switched proxy, try again in a few moments)");
               } else {
                 console.warn(`[${client.user.tag}] setAvatar error:`, avatarErr.message);
               }
@@ -2333,97 +2329,100 @@ for (const bot of config.bots) {
           return message.reply('No server profile changes could be applied.');
         }
       } catch (err) {
+        await proxyManager.handleRateLimit(err, 'Mimic artwork');
         console.error('Failed to mimic server artwork:', err.message);
         return message.reply(`Could not mimic server artwork: ${err.message}`);
       }
     }
 
     if (['!avatar', '!navatar', '!banner', '!nbanner'].includes(commandNameText)) {
-      const botsInGuild = activeBots
-        .filter(activeBot => activeBot.configuredGuildId === message.guild.id)
-        .sort((a, b) => a.index - b.index);
-
       if (!isOwnerOrAdmin(message.author.id, message.guild.id, message.member, message.guild)) {
-        if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
+        if (!isPrimaryInGuild) return;
         return message.reply('You do not have permission to change this server profile.');
       }
 
-      const isPrimaryInGuild = botsInGuild.length === 0 || botsInGuild[0].index === currentActiveIndex;
       if (!isPrimaryInGuild) return;
 
       const profileAsset = commandNameText.replace(/^!n?/, '');
 
       if (profileAsset === 'banner') {
-        if (!isPrimaryInGuild) return;
         return message.reply('Discord does not support banners for bot accounts via the API (Discord restricts bot banners to the Developer Portal app settings). You can set the bot avatar with `!avatar` or nickname with `!nick`.');
       }
 
       const resetRequested = args[1]?.toLowerCase() === 'reset';
       try {
         if (resetRequested) {
-          if (isPrimaryInGuild) {
-            try {
-              await client.user.setAvatar(null);
-              return message.reply("Reset bot avatar.");
-            } catch (err) {
-              return message.reply(`Could not reset avatar: ${err.message}`);
-            }
+          try {
+            await client.user.setAvatar(null);
+            return message.reply("Reset bot avatar.");
+          } catch (err) {
+            await proxyManager.handleRateLimit(err, 'Reset avatar');
+            return message.reply(`Could not reset avatar: ${err.message}`);
           }
-          return;
         }
 
         const attachment = message.attachments.first();
         if (!attachment) {
-          if (isPrimaryInGuild) {
-            return message.reply('Attach a PNG, JPEG, GIF, or WEBP image with `!avatar`, or use `!avatar reset`.');
-          }
-          return;
+          return message.reply('Attach a PNG, JPEG, GIF, or WEBP image with `!avatar`, or use `!avatar reset`.');
         }
 
         const allowedImageTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
         const imageType = attachment.contentType?.split(';')[0].toLowerCase();
         const maximumSize = 8 * 1024 * 1024;
         if (!allowedImageTypes.includes(imageType)) {
-          if (isPrimaryInGuild) {
-            return message.reply('Use a PNG, JPEG, GIF, or WEBP image.');
-          }
-          return;
+          return message.reply('Use a PNG, JPEG, GIF, or WEBP image.');
         }
         if (attachment.size > maximumSize) {
-          if (isPrimaryInGuild) {
-            return message.reply('The image must be no larger than 8 MB.');
-          }
-          return;
+          return message.reply('The image must be no larger than 8 MB.');
         }
 
         const imageResponse = await fetch(attachment.url);
         if (!imageResponse.ok) {
-          if (isPrimaryInGuild) {
-            return message.reply(`Could not download image (HTTP ${imageResponse.status}).`);
-          }
-          return;
+          return message.reply(`Could not download image (HTTP ${imageResponse.status}).`);
         }
         const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
 
-        if (isPrimaryInGuild) {
-          try {
-            await client.user.setAvatar(imageBytes);
-            return message.reply("Updated bot avatar.");
-          } catch (avatarErr) {
-            if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
-              return message.reply('Discord rate-limits avatar changes to twice per 10 minutes. Please wait a few minutes before trying again.');
-            }
-            throw avatarErr;
+        try {
+          await client.user.setAvatar(imageBytes);
+          return message.reply("Updated bot avatar.");
+        } catch (avatarErr) {
+          if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
+            await proxyManager.rotateProxy('Discord avatar 429 rate limit');
+            return message.reply('Discord rate-limited avatar changes; automatically rotated proxy. Please wait a few moments before trying again.');
           }
+          throw avatarErr;
         }
-        return;
       } catch (err) {
-        if (isPrimaryInGuild) {
-          console.error('Failed to update avatar:', err.message);
-          return message.reply(`Could not update avatar: ${err.message}`);
-        }
-        return;
+        await proxyManager.handleRateLimit(err, 'Avatar command');
+        console.error('Failed to update avatar:', err.message);
+        return message.reply(`Could not update avatar: ${err.message}`);
       }
+    }
+
+    // !nproxy or !proxy
+    if (commandNameText === '!nproxy' || commandNameText === '!proxy') {
+      if (!isOwnerOrAdmin(message.author.id, message.guild.id, message.member, message.guild)) {
+        if (!isPrimaryInGuild) return;
+        return message.reply('You do not have permission to view proxy details.');
+      }
+
+      if (!isPrimaryInGuild) return;
+
+      const subCommand = args[1]?.toLowerCase();
+      if (subCommand === 'rotate' || subCommand === 'switch') {
+        await proxyManager.rotateProxy('Manual owner rotation');
+        const current = proxyManager.maskProxy(proxyManager.currentProxyUrl);
+        return message.reply(`🔄 Rotated proxy to: \`${current}\` (Total pool: ${proxyManager.proxies.length})`);
+      }
+
+      if (subCommand === 'reload') {
+        const count = proxyManager.loadConfiguredProxies();
+        return message.reply(`🔄 Reloaded proxies. Total pool size: \`${count}\`.`);
+      }
+
+      const current = proxyManager.maskProxy(proxyManager.currentProxyUrl);
+      const poolCount = proxyManager.proxies.length;
+      return message.reply(`🌐 **Proxy Status:**\n• Active Proxy: \`${current}\`\n• Proxy Pool Size: \`${poolCount}\`\n• Auto-rotate on 429 Rate Limit: \`Enabled\`\n• Use \`!nproxy rotate\` to manually cycle proxy, or \`!nproxy reload\` to refresh from file.`);
     }
 
     const normalizedContent = normalizePrefixCommand(message.content);
@@ -2445,7 +2444,7 @@ for (const bot of config.bots) {
     const isSingleJoinCommand = !!joinMatch;
     const isClearAllCommand = contentLower === '!nclearall';
     const isPlayCommand = contentLower === '!nplay' || contentLower.startsWith('!nplay ') || contentLower === '!play' || contentLower.startsWith('!play ');
-    const allowedCommands = ['!njoin', '!nplay', '!nleave', '!nstop', '!npleave', '!nhelp', '!n700', '!n1000', '!ogvc'];
+    const allowedCommands = ['!njoin', '!nplay', '!nleave', '!nstop', '!npleave', '!nhelp', '!n700', '!n1000', '!ogvc', '!nproxy', '!proxy'];
     if (allowedCommands.includes(contentLower) || isPlayCommand || isTagCommand || isClearCommand || isShuffleCommand || isStopShuffleCommand || isKickCommand || isBanCommand || isTimeoutCommand || isUntimeoutCommand || isPingCommand || isModCommand || isSingleJoinCommand || isClearAllCommand || isServerMuteCommand || isServerUnmuteCommand || isMoveAllCommand) {
       let isAllowed = false;
 
@@ -2687,7 +2686,10 @@ for (const bot of config.bots) {
       const vc = message.member?.voice?.channel;
 
       if (!vc) {
-        return message.reply('Join a voice channel first.');
+        if (isPrimaryInGuild) {
+          return message.reply('Join a voice channel first.');
+        }
+        return;
       }
 
       intentionalLeave = false;
@@ -2696,7 +2698,10 @@ for (const bot of config.bots) {
       bot.channelId = vc.id;
 
       joinChannel(vc.guild.id, vc.id);
-      return message.reply('Joining the voice channel.');
+      if (isPrimaryInGuild) {
+        return message.reply('Joining the voice channel.');
+      }
+      return;
     }
 
     // !nplay or !play
@@ -2709,29 +2714,25 @@ for (const bot of config.bots) {
 
       const vc = message.member?.voice?.channel;
       if (!vc) {
-        return message.reply('Join a voice channel first to play audio.');
-      }
-
-      // Check all active bots for this guild
-      const botsInThisGuild = activeBots
-        .filter(b => b.configuredGuildId === message.guild.id)
-        .sort((a, b) => a.index - b.index);
-
-      // Find if any bot is already in user's VC
-      const botInVc = botsInThisGuild.find(b => {
-        const memberMe = b.client.guilds.cache.get(message.guild.id)?.members.me;
-        return memberMe?.voice?.channelId && memberMe.voice.channelId === vc.id;
-      });
-
-      // Exactly ONE bot responds: the one in the VC, or the first bot configured for this guild
-      const targetBot = botInVc || botsInThisGuild[0];
-      if (targetBot && targetBot.index !== currentActiveIndex) {
+        if (isPrimaryInGuild) {
+          return message.reply('Join a voice channel first to play audio.');
+        }
         return;
       }
 
-      // If a song query is provided, play via Lavalink
+      // If a song query is provided, play via Lavalink (single-bot queue/playback)
       const hasConnectedNode = poru && Array.from(poru.nodes.values()).some(n => n.isConnected);
       if (query && hasConnectedNode) {
+        const botInVc = botsInThisGuild.find(b => {
+          const memberMe = b.client.guilds.cache.get(message.guild.id)?.members.me;
+          return memberMe?.voice?.channelId && memberMe.voice.channelId === vc.id;
+        });
+
+        const targetBot = botInVc || botsInThisGuild[0];
+        if (targetBot && targetBot.index !== currentActiveIndex) {
+          return;
+        }
+
         try {
           if (player.state.status === 'playing') {
             player.stop();
@@ -2769,7 +2770,7 @@ for (const bot of config.bots) {
         }
       }
 
-      // Normal play command (or fallback): play the recorded audio (a1.mp3)
+      // Normal play command (or fallback): ALL bots in this guild play the recorded audio (a1.mp3) simultaneously
       if (!connection || bot.channelId !== vc.id) {
         bot.guildId = vc.guild.id;
         bot.channelId = vc.id;
@@ -2803,8 +2804,11 @@ for (const bot of config.bots) {
       resource.volume.setVolume(currentVolume);
       player.play(resource);
 
-      const notice = query && !hasConnectedNode ? ' (Lavalink node unreachable, playing recorded audio)' : '';
-      return message.reply(`Playing recorded audio (Volume: ${currentVolume * 100}%, Bass Boost: ${currentBassBoost ? 'ON' : 'OFF'})${notice}.`);
+      if (isPrimaryInGuild) {
+        const notice = query && !hasConnectedNode ? ' (Lavalink node unreachable, playing recorded audio)' : '';
+        return message.reply(`Playing recorded audio (Volume: ${currentVolume * 100}%, Bass Boost: ${currentBassBoost ? 'ON' : 'OFF'})${notice}.`);
+      }
+      return;
     }
 
     // !nstop
@@ -2816,7 +2820,10 @@ for (const bot of config.bots) {
       if (poruPlayer) {
         try { poruPlayer.destroy(); } catch (err) {}
       }
-      return message.reply('Stopped audio playback.');
+      if (isPrimaryInGuild) {
+        return message.reply('Stopped audio playback.');
+      }
+      return;
     }
 
     // !nleave or !ogvc
@@ -2834,7 +2841,10 @@ for (const bot of config.bots) {
         bot.channelId = defaultChannelId;
         intentionalLeave = false;
         joinChannel(defaultGuildId, defaultChannelId);
-        return message.reply('Connecting to the original voice channel.');
+        if (isPrimaryInGuild) {
+          return message.reply('Connecting to the original voice channel.');
+        }
+        return;
       }
 
       bot.guildId = defaultGuildId;
@@ -2851,7 +2861,10 @@ for (const bot of config.bots) {
       }
 
       joinChannel(defaultGuildId, defaultChannelId);
-      return message.reply('Returning to the original voice channel.');
+      if (isPrimaryInGuild) {
+        return message.reply('Returning to the original voice channel.');
+      }
+      return;
     }
 
     // !npleave
@@ -2879,7 +2892,10 @@ for (const bot of config.bots) {
         connection = null;
       }
 
-      return message.reply('Left the voice channel permanently.');
+      if (isPrimaryInGuild) {
+        return message.reply('Left the voice channel permanently.');
+      }
+      return;
     }
 
     // !n700
@@ -2903,10 +2919,16 @@ for (const bot of config.bots) {
         });
         resource.volume.setVolume(7.0);
         player.play(resource);
-        return message.reply('Volume boosted to 700% and Bass Boost enabled.');
+        if (isPrimaryInGuild) {
+          return message.reply('Volume boosted to 700% and Bass Boost enabled.');
+        }
+        return;
       }
       
-      return message.reply('Volume boosted to 700% and Bass Boost enabled for next playback.');
+      if (isPrimaryInGuild) {
+        return message.reply('Volume boosted to 700% and Bass Boost enabled for next playback.');
+      }
+      return;
     }
 
     // !n1000
@@ -2932,10 +2954,16 @@ for (const bot of config.bots) {
         });
         resource.volume.setVolume(10.0);
         player.play(resource);
-        return message.reply('Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.');
+        if (isPrimaryInGuild) {
+          return message.reply('Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.');
+        }
+        return;
       }
       
-      return message.reply('Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.');
+      if (isPrimaryInGuild) {
+        return message.reply('Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.');
+      }
+      return;
     }
 
     // !kick
