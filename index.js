@@ -5,6 +5,8 @@ const {
   createAudioResource,
   NoSubscriberBehavior,
   VoiceConnectionStatus,
+  VoiceConnectionDisconnectReason,
+  entersState,
   StreamType,
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
@@ -657,9 +659,10 @@ for (const bot of config.bots) {
     secure: process.env.LAVALINK_SECURE === 'true'
   };
 
-  const poru = new Poru(client, [
+  // Initialize Poru strictly on the primary bot (index 0) to avoid 429 connection storms
+  const poru = (currentActiveIndex === 0) ? new Poru(client, [
     {
-      name: `lavalink-node-${currentActiveIndex + 1}`,
+      name: 'lavalink-primary',
       host: lavalinkConfig.host,
       port: lavalinkConfig.port,
       password: lavalinkConfig.password,
@@ -668,35 +671,33 @@ for (const bot of config.bots) {
   ], {
     library: 'discord.js',
     defaultPlatform: 'ytsearch'
-  });
+  }) : null;
 
-  poru.on('nodeConnect', (node) => {
-    if (currentActiveIndex === 0) console.log(`[Lavalink] Connected to node: ${node.name}`);
-  });
-  poru.on('nodeError', (node, err) => {
-    if (currentActiveIndex === 0) console.warn(`[Lavalink] Node notice (${node.name}): ${err?.message || err}`);
-  });
-  poru.on('nodeDisconnect', (node) => {
-    if (currentActiveIndex === 0) console.warn(`[Lavalink] Node disconnected: ${node.name}`);
-  });
-  poru.on('nodeReconnect', (node) => {
-    if (currentActiveIndex === 0) console.log(`[Lavalink] Node reconnecting: ${node.name}`);
-  });
-  poru.on('trackStart', (p, track) => {
-    const botsInGuild = activeBots.filter(b => b.configuredGuildId === p.guildId).sort((a, b) => a.index - b.index);
-    if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
-    const ch = client.channels.cache.get(p.textChannel);
-    if (ch) ch.send(`🎵 Now playing: **${track.info.title}** by **${track.info.author}**`).catch(() => {});
-  });
-  poru.on('queueEnd', (p) => {
-    const botsInGuild = activeBots.filter(b => b.configuredGuildId === p.guildId).sort((a, b) => a.index - b.index);
-    if (botsInGuild.length > 0 && botsInGuild[0].index !== currentActiveIndex) return;
-    const ch = client.channels.cache.get(p.textChannel);
-    if (ch) ch.send('🏁 Song queue ended.').catch(() => {});
-  });
-  poru.on('trackError', (p, track, err) => {
-    console.error(`[Bot ${currentActiveIndex + 1}] Track error on ${track.info.title}:`, err?.message || err);
-  });
+  if (poru) {
+    poru.on('nodeConnect', (node) => {
+      console.log(`[Lavalink] Connected to node: ${node.name}`);
+    });
+    poru.on('nodeError', (node, err) => {
+      console.warn(`[Lavalink] Node notice (${node.name}): ${err?.message || err}`);
+    });
+    poru.on('nodeDisconnect', (node) => {
+      console.warn(`[Lavalink] Node disconnected: ${node.name}`);
+    });
+    poru.on('nodeReconnect', (node) => {
+      console.log(`[Lavalink] Node reconnecting: ${node.name}`);
+    });
+    poru.on('trackStart', (p, track) => {
+      const ch = client.channels.cache.get(p.textChannel);
+      if (ch) ch.send(`🎵 Now playing: **${track.info.title}** by **${track.info.author}**`).catch(() => {});
+    });
+    poru.on('queueEnd', (p) => {
+      const ch = client.channels.cache.get(p.textChannel);
+      if (ch) ch.send('🏁 Song queue ended.').catch(() => {});
+    });
+    poru.on('trackError', (p, track, err) => {
+      console.error(`[Lavalink] Track error on ${track.info.title}:`, err?.message || err);
+    });
+  }
 
   const muteAllMembers = async () => {
     if (!connection || !bot.guildId || !bot.channelId) return;
@@ -734,37 +735,22 @@ for (const bot of config.bots) {
     } catch (e) {}
   };
 
-  // Wrapped adapter to inject self_video: true on initial Opcode 4 (Voice State Update)
-  const makeFakeVideoAdapterCreator = (guild) => {
-    const originalCreator = guild.voiceAdapterCreator;
-    return (methods) => {
-      const adapter = originalCreator(methods);
-      const originalSendPayload = adapter.sendPayload;
-
-      adapter.sendPayload = (data) => {
-        if (data && data.op === 4) {
-          if (data.d) {
-            data.d.self_video = true;
-          }
-        }
-        try {
-          return originalSendPayload.call(adapter, data);
-        } catch (err) {
-          console.warn(`[${client.user.tag}] Voice state send warning (shard inactive): ${err.message}`);
-          return false;
-        }
-      };
-
-      return adapter;
-    };
-  };
-
   // Main voice channel join logic
   const joinChannel = async (guildId, channelId) => {
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
       reconnectTimeout = null;
     }
+
+    if (isJoining) return;
+
+    // If already connected or establishing connection to this exact channel, don't interrupt
+    if (connection && (connection.state.status === VoiceConnectionStatus.Ready || connection.state.status === VoiceConnectionStatus.Connecting || connection.state.status === VoiceConnectionStatus.Signalling)) {
+      if (connection.joinConfig.channelId === channelId) {
+        return;
+      }
+    }
+
     if (connectionTimeout) {
       clearTimeout(connectionTimeout);
       connectionTimeout = null;
@@ -781,23 +767,23 @@ for (const bot of config.bots) {
     }
 
     try {
-
       const guild = await client.guilds.fetch(guildId);
       const channel = await guild.channels.fetch(channelId);
 
+      // Clean standard voice connection with bot-isolated group ID
       connection = joinVoiceChannel({
         channelId: channel.id,
         guildId: guild.id,
-        adapterCreator: makeFakeVideoAdapterCreator(guild),
+        adapterCreator: guild.voiceAdapterCreator,
         selfDeaf: false,
         group: client.user.id,
       });
 
       connection.subscribe(player);
 
-      // Start watchdog timer (20 seconds) to handle stuck connecting/signalling
+      // Start watchdog timer (45 seconds) to handle genuinely stuck handshakes
       connectionTimeout = setTimeout(() => {
-        if (connection && connection.state.status !== VoiceConnectionStatus.Ready) {
+        if (connection && connection.state.status !== VoiceConnectionStatus.Ready && connection.state.status !== VoiceConnectionStatus.Destroyed) {
           if (!bot._warnedStuck) {
             bot._warnedStuck = true;
             console.warn(`[${client.user.tag}] Voice connection pending (${connection.state.status}). Reconnecting...`);
@@ -806,13 +792,16 @@ for (const bot of config.bots) {
             clearTimeout(connectionTimeout);
             connectionTimeout = null;
           }
-          connection.destroy();
+          isJoining = false;
+          try {
+            connection.destroy();
+          } catch {}
           connection = null;
           if (!intentionalLeave) {
             triggerReconnect();
           }
         }
-      }, 20000);
+      }, 45000);
 
       // Prevent crash by handling errors on the connection instance
       connection.on('error', (err) => {
@@ -820,30 +809,28 @@ for (const bot of config.bots) {
         if (!bot._lastVoiceErrTime || now - bot._lastVoiceErrTime > 30000 || bot._lastVoiceErrMsg !== err.message) {
           bot._lastVoiceErrTime = now;
           bot._lastVoiceErrMsg = err.message;
-          console.warn(`[${client.user.tag}] Voice error: ${err.message}`);
-        }
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout);
-          connectionTimeout = null;
-        }
-        if (!intentionalLeave) {
-          triggerReconnect();
+          console.warn(`[${client.user.tag}] Voice notice: ${err.message}`);
         }
       });
 
-      // Listen for connection status changes
-      connection.on('stateChange', (oldState, newState) => {
+      // Listen for connection status changes using official @discordjs/voice patterns
+      connection.on('stateChange', async (oldState, newState) => {
         if (newState.status === VoiceConnectionStatus.Ready) {
           isJoining = false;
           bot._warnedStuck = false;
           bot._reconnectAttempts = 0;
+          connection.rejoinAttempts = 0;
+          if (connectionTimeout) {
+            clearTimeout(connectionTimeout);
+            connectionTimeout = null;
+          }
           if (!bot._hasConnectedVoice) {
             bot._hasConnectedVoice = true;
             console.log(`[${client.user.tag}] Connected to voice: ${guild.name} -> ${channel.name}`);
           }
         }
 
-        if (newState.status === VoiceConnectionStatus.Ready || newState.status === VoiceConnectionStatus.Destroyed) {
+        if (newState.status === VoiceConnectionStatus.Destroyed) {
           isJoining = false;
           if (connectionTimeout) {
             clearTimeout(connectionTimeout);
@@ -851,12 +838,48 @@ for (const bot of config.bots) {
           }
         }
 
-        // Auto-reconnect if it gets disconnected unexpectedly (and Poru is not playing)
-        if (newState.status === 'disconnected' && !intentionalLeave) {
-          bot._hasConnectedVoice = false;
-          if (!poru?.players.has(guildId)) {
-            triggerReconnect();
+        // Handle disconnects gracefully with auto-rejoin before hard destroying
+        if (newState.status === VoiceConnectionStatus.Disconnected && !intentionalLeave) {
+          if (newState.reason === VoiceConnectionDisconnectReason.WebSocketClose && newState.closeCode === 4014) {
+            // Channel move or server switch: wait to see if it shifts to Signalling or Connecting
+            try {
+              await Promise.race([
+                entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+                entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+              ]);
+              return;
+            } catch {
+              // Genuinely disconnected
+              isJoining = false;
+              try {
+                connection.destroy();
+              } catch {}
+              connection = null;
+              bot._hasConnectedVoice = false;
+              triggerReconnect();
+              return;
+            }
+          } else if ((connection.rejoinAttempts || 0) < 5) {
+            // Temporary network drop: attempt clean rejoin without destroying the connection
+            connection.rejoinAttempts = (connection.rejoinAttempts || 0) + 1;
+            await new Promise(r => setTimeout(r, connection.rejoinAttempts * 2500));
+            if (connection && connection.state.status === VoiceConnectionStatus.Disconnected) {
+              try {
+                connection.rejoin();
+                return;
+              } catch {}
+            } else {
+              return;
+            }
           }
+
+          isJoining = false;
+          try {
+            connection.destroy();
+          } catch {}
+          connection = null;
+          bot._hasConnectedVoice = false;
+          triggerReconnect();
         }
       });
     } catch (err) {
@@ -879,19 +902,17 @@ for (const bot of config.bots) {
     }
   };
 
-  // Reconnection helper
+  // Reconnection helper with progressive backoff and jitter
   const triggerReconnect = () => {
     if (reconnectTimeout) return;
 
     bot._reconnectAttempts = (bot._reconnectAttempts || 0) + 1;
-    const baseDelay = Math.min(30000, 5000 * Math.min(6, bot._reconnectAttempts));
-    const reconnectDelay = baseDelay + Math.floor(Math.random() * 5000);
+    const baseDelay = Math.min(30000, 4000 * Math.min(6, bot._reconnectAttempts));
+    const reconnectDelay = baseDelay + Math.floor(Math.random() * 4000);
     reconnectTimeout = setTimeout(() => {
       reconnectTimeout = null;
-      if (!intentionalLeave) {
-        if (bot.guildId && bot.channelId) {
-          joinChannel(bot.guildId, bot.channelId);
-        }
+      if (!intentionalLeave && bot.guildId && bot.channelId) {
+        joinChannel(bot.guildId, bot.channelId);
       }
     }, reconnectDelay);
   };
@@ -899,10 +920,12 @@ for (const bot of config.bots) {
   client.once('ready', async () => {
     console.log(`${client.user.tag} is online`);
 
-    try {
-      poru.init(client);
-    } catch (poruErr) {
-      console.warn(`[Bot ${currentActiveIndex + 1}] Poru init: ${poruErr?.message || poruErr}`);
+    if (poru) {
+      try {
+        poru.init(client);
+      } catch (poruErr) {
+        console.warn(`[Lavalink] Poru init notice: ${poruErr?.message || poruErr}`);
+      }
     }
 
     if (!defaultGuildId) {
@@ -946,7 +969,8 @@ for (const bot of config.bots) {
       index: currentActiveIndex,
       client: client,
       configuredGuildId: defaultGuildId,
-      bot: bot
+      bot: bot,
+      poru: poru
     });
     proxyManager.setActiveBots(activeBots);
 
@@ -1387,18 +1411,25 @@ for (const bot of config.bots) {
 
     if (bot.guildId && bot.channelId) {
       intentionalLeave = false;
-      joinChannel(bot.guildId, bot.channelId);
+      const staggerDelay = (currentActiveIndex % 10) * 1200;
+      setTimeout(() => {
+        if (!intentionalLeave && bot.guildId && bot.channelId) {
+          joinChannel(bot.guildId, bot.channelId);
+        }
+      }, staggerDelay);
     }
   });
 
   client.on('raw', (packet) => {
-    try {
-      poru.packetUpdate(packet);
-    } catch (err) {}
+    if (poru) {
+      try {
+        poru.packetUpdate(packet);
+      } catch (err) {}
+    }
   });
 
   client.on('voiceStateUpdate', async (oldState, newState) => {
-    if (newState.guild.id !== defaultGuildId) return;
+    if (bot.guildId && newState.guild.id !== bot.guildId) return;
 
     if (newState.member.id !== client.user.id) {
       if (isMutingEveryone && newState.channelId === bot.channelId) {
@@ -1412,14 +1443,11 @@ for (const bot of config.bots) {
     }
 
     if (!newState.channelId) {
-      if (!intentionalLeave && !isJoining) {
-        if (bot._hasConnectedVoice) {
-          bot._hasConnectedVoice = false;
-          console.log(`[${client.user.tag}] Voice disconnected. Reconnecting...`);
-        }
-        player.stop();
-        triggerReconnect();
+      if (bot._hasConnectedVoice) {
+        bot._hasConnectedVoice = false;
       }
+      player.stop();
+      // Let the VoiceConnection stateChange listener handle auto-rejoin / reconnect without collision
     } else {
       // Update target channel if bot is moved by a user and connection is ready
       if (connection && connection.state.status === VoiceConnectionStatus.Ready) {
@@ -1556,7 +1584,8 @@ for (const bot of config.bots) {
       const query = interaction.options.getString('query')?.trim();
       const vc = interaction.member?.voice?.channel;
 
-      const hasConnectedNode = poru && Array.from(poru.nodes.values()).some(n => n.isConnected);
+      const activePoru = poru || activeBots.find(b => b.poru)?.poru;
+      const hasConnectedNode = activePoru && Array.from(activePoru.nodes.values()).some(n => n.isConnected);
 
       if (query && hasConnectedNode) {
         if (!vc) {
@@ -1569,7 +1598,7 @@ for (const bot of config.bots) {
             player.stop();
           }
 
-          const poruPlayer = poru.createConnection({
+          const poruPlayer = activePoru.createConnection({
             guildId: interaction.guild.id,
             voiceChannel: vc.id,
             textChannel: interaction.channel.id,
@@ -1577,7 +1606,7 @@ for (const bot of config.bots) {
           });
 
           const resolveSource = query.startsWith('http://') || query.startsWith('https://') ? null : 'ytsearch';
-          const res = await poru.resolve({ query, source: resolveSource, requester: interaction.user });
+          const res = await activePoru.resolve({ query, source: resolveSource, requester: interaction.user });
 
           if (!res || res.loadType === 'error' || res.loadType === 'empty' || !res.tracks.length) {
             return interaction.editReply({ content: `❌ No results found for \`${query}\`.` });
@@ -1646,7 +1675,8 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
-      const poruPlayer = poru?.players.get(interaction.guild?.id);
+      const activePoru = poru || activeBots.find(b => b.poru)?.poru;
+      const poruPlayer = activePoru?.players.get(interaction.guild?.id);
       if (poruPlayer) {
         try { poruPlayer.destroy(); } catch (err) {}
       }
@@ -1657,7 +1687,8 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
-      const poruPlayer = poru?.players.get(interaction.guild?.id);
+      const activePoru = poru || activeBots.find(b => b.poru)?.poru;
+      const poruPlayer = activePoru?.players.get(interaction.guild?.id);
       if (poruPlayer) {
         try { poruPlayer.destroy(); } catch (err) {}
       }
@@ -1691,7 +1722,8 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
-      const poruPlayer = poru?.players.get(interaction.guild?.id);
+      const activePoru = poru || activeBots.find(b => b.poru)?.poru;
+      const poruPlayer = activePoru?.players.get(interaction.guild?.id);
       if (poruPlayer) {
         try { poruPlayer.destroy(); } catch (err) {}
       }
@@ -2728,56 +2760,49 @@ for (const bot of config.bots) {
         return;
       }
 
-      // If a song query is provided, play via Lavalink across all bots in this guild
-      const hasConnectedNode = poru && Array.from(poru.nodes.values()).some(n => n.isConnected);
+      // If a song query is provided, play via Lavalink (handled by master bot's Poru instance)
+      const activePoru = poru || activeBots.find(b => b.poru)?.poru;
+      const hasConnectedNode = activePoru && Array.from(activePoru.nodes.values()).some(n => n.isConnected);
       if (query && hasConnectedNode) {
-        try {
-          if (player.state.status === 'playing') {
-            player.stop();
-          }
+        if (player.state.status === 'playing') {
+          player.stop();
+        }
 
-          const poruPlayer = poru.createConnection({
-            guildId: message.guild.id,
-            voiceChannel: vc.id,
-            textChannel: message.channel.id,
-            deaf: false
-          });
+        // Only primary bot initiates Poru connection and sends the message
+        if (isPrimaryInGuild && activePoru) {
+          try {
+            const poruPlayer = activePoru.createConnection({
+              guildId: message.guild.id,
+              voiceChannel: vc.id,
+              textChannel: message.channel.id,
+              deaf: false
+            });
 
-          const resolveSource = query.startsWith('http://') || query.startsWith('https://') ? null : 'ytsearch';
-          const res = await poru.resolve({ query, source: resolveSource, requester: message.author });
+            const resolveSource = query.startsWith('http://') || query.startsWith('https://') ? null : 'ytsearch';
+            const res = await activePoru.resolve({ query, source: resolveSource, requester: message.author });
 
-          if (!res || res.loadType === 'error' || res.loadType === 'empty' || !res.tracks?.length) {
-            if (isPrimaryInGuild) {
+            if (!res || res.loadType === 'error' || res.loadType === 'empty' || !res.tracks?.length) {
               return message.reply(`❌ No results found for \`${query}\`.`);
             }
-            return;
-          }
 
-          if (res.loadType === 'playlist') {
-            for (const track of res.tracks) {
-              poruPlayer.queue.add(track);
-            }
-            if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
-            if (isPrimaryInGuild) {
+            if (res.loadType === 'playlist') {
+              for (const track of res.tracks) {
+                poruPlayer.queue.add(track);
+              }
+              if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
               return message.reply(`🎶 Added playlist **${res.playlistInfo?.name || query}** (${res.tracks.length} tracks) to queue.`);
-            }
-            return;
-          } else {
-            const track = res.tracks[0];
-            poruPlayer.queue.add(track);
-            if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
-            if (isPrimaryInGuild) {
+            } else {
+              const track = res.tracks[0];
+              poruPlayer.queue.add(track);
+              if (!poruPlayer.isPlaying && !poruPlayer.isPaused) poruPlayer.play();
               return message.reply(`🎵 Added to queue: **${track.info.title}** by **${track.info.author}**`);
             }
-            return;
-          }
-        } catch (err) {
-          console.error('[!nplay Lavalink Error]:', err);
-          if (isPrimaryInGuild) {
+          } catch (err) {
+            console.error('[!nplay Lavalink Error]:', err);
             return message.reply(`⚠️ Lavalink error: ${err.message || 'Unknown'}.`);
           }
-          return;
         }
+        return;
       }
 
       // Normal play command (or fallback): ALL bots in this guild play the recorded audio (a1.mp3) simultaneously
@@ -2826,7 +2851,8 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
-      const poruPlayer = poru?.players.get(message.guild?.id);
+      const activePoru = poru || activeBots.find(b => b.poru)?.poru;
+      const poruPlayer = activePoru?.players.get(message.guild?.id);
       if (poruPlayer) {
         try { poruPlayer.destroy(); } catch (err) {}
       }
@@ -2841,7 +2867,8 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
-      const poruPlayer = poru?.players.get(message.guild?.id);
+      const activePoru = poru || activeBots.find(b => b.poru)?.poru;
+      const poruPlayer = activePoru?.players.get(message.guild?.id);
       if (poruPlayer) {
         try { poruPlayer.destroy(); } catch (err) {}
       }
@@ -2883,7 +2910,8 @@ for (const bot of config.bots) {
       isMutingEveryone = false;
       unmuteAllMembers();
       player.stop();
-      const poruPlayer = poru?.players.get(message.guild?.id);
+      const activePoru = poru || activeBots.find(b => b.poru)?.poru;
+      const poruPlayer = activePoru?.players.get(message.guild?.id);
       if (poruPlayer) {
         try { poruPlayer.destroy(); } catch (err) {}
       }
