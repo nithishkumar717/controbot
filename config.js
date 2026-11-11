@@ -194,9 +194,9 @@ module.exports = {
   ],
 
   lavalink: {
-    host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
-    port: parseInt(process.env.LAVALINK_PORT || '13592', 10),
-    password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
+    host: process.env.LAVALINK_HOST || 'jobs.hidencloud.com',
+    port: parseInt(process.env.LAVALINK_PORT || '24704', 10),
+    password: process.env.LAVALINK_PASSWORD || 'nerdxlive',
     secure: process.env.LAVALINK_SECURE === 'true'
   }
 };

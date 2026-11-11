@@ -10,6 +10,7 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
+const { LavalinkManager } = require('lavalink-client');
 
 const config = require('./config');
 const fs = require('fs');
@@ -19,7 +20,6 @@ const ffmpegBin = ffmpegStatic || 'ffmpeg';
 process.env.FFMPEG_PATH = ffmpegBin;
 const defaultAudioPath = path.join(__dirname, 'audio', 'a1.mp3');
 const gitWatchdog = require('./git-watchdog');
-const proxyManager = require('./proxy-manager');
 
 // Load persistent whitelist
 const whitelistFilePath = path.join(__dirname, 'whitelist.json');
@@ -165,6 +165,7 @@ function isOwnerOrAdmin(userId, guildId, member = null, guild = null) {
 
 // Active bots tracking
 const activeBots = [];
+const songManagersByGuild = new Map();
 
 // Active shuffle loops tracking (guildId -> { interval, channelId })
 const activeShuffleIntervals = new Map();
@@ -227,98 +228,6 @@ async function shuffleUsers(guild, targetVoiceChannel) {
   }
 
   return { success: true, movedCount };
-}
-
-// Moderation Helper: Kick Member
-async function kickMember(guild, member, executor, reason) {
-  if (!guild || !member) return { success: false, error: 'Invalid member or guild.' };
-  
-  const botMember = guild.members.me;
-  if (!botMember || !botMember.permissions.has('KickMembers')) {
-    return { success: false, error: 'Bot is missing the "Kick Members" permission.' };
-  }
-
-  if (member.roles.highest.position >= botMember.roles.highest.position) {
-    return { success: false, error: 'Cannot kick this member due to role hierarchy.' };
-  }
-
-  try {
-    await member.kick(`Kicked by ${executor.tag}: ${reason || 'No reason provided'}`);
-    return { success: true };
-  } catch (err) {
-    console.error('Failed to kick member:', err);
-    return { success: false, error: err.message };
-  }
-}
-
-// Moderation Helper: Ban Member
-async function banMember(guild, member, executor, reason, deleteDays = 0) {
-  if (!guild || !member) return { success: false, error: 'Invalid member or guild.' };
-
-  const botMember = guild.members.me;
-  if (!botMember || !botMember.permissions.has('BanMembers')) {
-    return { success: false, error: 'Bot is missing the "Ban Members" permission.' };
-  }
-
-  if (member.roles && member.roles.highest.position >= botMember.roles.highest.position) {
-    return { success: false, error: 'Cannot ban this member due to role hierarchy.' };
-  }
-
-  try {
-    await guild.members.ban(member, {
-      deleteMessageSeconds: deleteDays * 24 * 60 * 60,
-      reason: `Banned by ${executor.tag}: ${reason || 'No reason provided'}`
-    });
-    return { success: true };
-  } catch (err) {
-    console.error('Failed to ban member:', err);
-    return { success: false, error: err.message };
-  }
-}
-
-// Moderation Helper: Timeout Member
-async function timeoutMember(guild, member, executor, durationMinutes, reason) {
-  if (!guild || !member) return { success: false, error: 'Invalid member or guild.' };
-
-  const botMember = guild.members.me;
-  if (!botMember || !botMember.permissions.has('ModerateMembers')) {
-    return { success: false, error: 'Bot is missing the "Moderate Members" permission.' };
-  }
-
-  if (member.roles.highest.position >= botMember.roles.highest.position) {
-    return { success: false, error: 'Cannot timeout this member due to role hierarchy.' };
-  }
-
-  const durationMs = durationMinutes * 60 * 1000;
-  try {
-    await member.timeout(durationMs, `Timed out by ${executor.tag}: ${reason || 'No reason provided'}`);
-    return { success: true };
-  } catch (err) {
-    console.error('Failed to timeout member:', err);
-    return { success: false, error: err.message };
-  }
-}
-
-// Moderation Helper: Untimeout Member
-async function untimeoutMember(guild, member, executor) {
-  if (!guild || !member) return { success: false, error: 'Invalid member or guild.' };
-
-  const botMember = guild.members.me;
-  if (!botMember || !botMember.permissions.has('ModerateMembers')) {
-    return { success: false, error: 'Bot is missing the "Moderate Members" permission.' };
-  }
-
-  if (member.roles.highest.position >= botMember.roles.highest.position) {
-    return { success: false, error: 'Cannot untimeout this member due to role hierarchy.' };
-  }
-
-  try {
-    await member.timeout(null, `Timeout removed by ${executor.tag}`);
-    return { success: true };
-  } catch (err) {
-    console.error('Failed to untimeout member:', err);
-    return { success: false, error: err.message };
-  }
 }
 
 // Moderation Helper: Server Mute Member
@@ -534,26 +443,27 @@ async function promptModerationConfirm(target, titleText, executorId, onConfirm)
   }
 }
 
-// Helper to execute server profile mimic (nickname, avatar, banner)
-async function executeMimic(guild, client, subArg, proxyManager) {
+// Copy server profile fields to this bot's guild-specific member profile.
+async function executeMimic(guild, client, subArg) {
   try {
     const fetchedGuild = await guild.fetch();
     const actionsPerformed = [];
     const notes = [];
+    const editGuildProfile = async fields => fetchedGuild.members.editMe(fields);
 
-    // 1. Server Nickname
+    // Nicknames, avatars, banners, and bios are edited on the guild member,
+    // so mimicking one server never changes the bot's global profile.
     if (subArg === 'nick' || subArg === 'all') {
       const serverNameNick = fetchedGuild.name.slice(0, 32);
       try {
-        await fetchedGuild.members.me.setNickname(serverNameNick);
+        await editGuildProfile({ nick: serverNameNick });
         actionsPerformed.push(`server nickname to "${serverNameNick}"`);
       } catch (nickErr) {
-        if (proxyManager) await proxyManager.handleRateLimit(nickErr, 'Mimic nickname');
         notes.push(`Nickname error: ${nickErr.message}`);
       }
     }
 
-    // 2. Server Icon to Avatar
+    // Server icon to this bot's guild-specific avatar.
     if (subArg === 'avatar' || subArg === 'icon' || subArg === 'all') {
       const iconUrl = fetchedGuild.iconURL({
         extension: 'png',
@@ -568,12 +478,11 @@ async function executeMimic(guild, client, subArg, proxyManager) {
           const imageResponse = await fetch(iconUrl);
           if (!imageResponse.ok) throw new Error(`HTTP ${imageResponse.status}`);
           const imageBytes = Buffer.from(await imageResponse.arrayBuffer());
-          await client.user.setAvatar(imageBytes);
-          actionsPerformed.push('server icon to bot avatar');
+          await editGuildProfile({ avatar: imageBytes });
+          actionsPerformed.push('server icon to this server’s bot avatar');
         } catch (avatarErr) {
           if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
-            if (proxyManager) await proxyManager.rotateProxy('Discord avatar 429 rate limit');
-            notes.push('Avatar rate-limited (cycled proxy)');
+            notes.push(`Avatar rate-limited: ${avatarErr.message}`);
           } else {
             notes.push(`Avatar error: ${avatarErr.message}`);
           }
@@ -581,26 +490,36 @@ async function executeMimic(guild, client, subArg, proxyManager) {
       }
     }
 
-    // 3. Server Banner
+    // Server banner to this bot's guild-specific banner.
     if (subArg === 'banner' || subArg === 'all') {
-      const bannerUrl = fetchedGuild.bannerURL({ extension: 'png', size: 1024 }) ||
-        fetchedGuild.splashURL({ extension: 'png', size: 1024 }) ||
-        fetchedGuild.discoverySplashURL({ extension: 'png', size: 1024 });
+      const bannerUrl = fetchedGuild.bannerURL({ extension: 'png', size: 1024 });
 
       if (!bannerUrl) {
-        notes.push('Server has no banner or splash image');
+        notes.push('Server has no banner to copy');
       } else {
         try {
           const bannerRes = await fetch(bannerUrl);
           if (!bannerRes.ok) throw new Error(`HTTP ${bannerRes.status}`);
           const bannerBuf = Buffer.from(await bannerRes.arrayBuffer());
-          const bannerBase64 = `data:image/png;base64,${bannerBuf.toString('base64')}`;
-          await client.rest.patch(Routes.user(), {
-            body: { banner: bannerBase64 }
-          });
-          actionsPerformed.push('server banner to bot banner');
+          await editGuildProfile({ banner: bannerBuf });
+          actionsPerformed.push('server banner to this server’s bot banner');
         } catch (bannerErr) {
           notes.push(`Banner note: ${bannerErr.message}`);
+        }
+      }
+    }
+
+    // Server description to this bot's guild-specific bio.
+    if (subArg === 'bio' || subArg === 'all') {
+      const serverBio = fetchedGuild.description?.trim();
+      if (!serverBio) {
+        notes.push('Server has no description to copy as a bio');
+      } else {
+        try {
+          await editGuildProfile({ bio: serverBio });
+          actionsPerformed.push('server description to this server’s bot bio');
+        } catch (bioErr) {
+          notes.push(`Bio note: ${bioErr.message}`);
         }
       }
     }
@@ -616,8 +535,7 @@ async function executeMimic(guild, client, subArg, proxyManager) {
     }
     return summary;
   } catch (err) {
-    if (proxyManager) await proxyManager.handleRateLimit(err, 'Mimic artwork');
-    return `❌ Could not mimic server artwork: ${err.message}`;
+    return `❌ Could not mimic server profile: ${err.message}`;
   }
 }
 
@@ -630,20 +548,19 @@ async function sendAnimatedHelp(target, guild, clientUser) {
     `**🔊 VOICE & MUSIC**\n` +
     `• \`!join\` / \`!join[num]\` : Join your voice channel (e.g. \`!join25\`)\n` +
     `• \`!play\` / \`!stop\` : Play recorded audio or stop playback\n` +
+    `• \`!playsong <song or URL>\` / \`!ps <song or URL>\` or \`/playsong\` : Search and play songs through Lavalink\n` +
     `• \`!leave\` : Return to the configured voice channel\n` +
     `• \`!pleave\` : Disconnect from voice\n` +
     `• \`!700\` / \`!1000\` : Set boosted playback volume\n\n` +
     `**🛡️ MANAGEMENT & UTILITY**\n` +
     `• \`!wl [add|remove|list] @member\` : Manage this server's whitelist\n` +
     `• \`!clear [count]\` / \`!clearall\` : Clear messages\n` +
-    `• \`!kick @member\` / \`!ban @member\` : Moderate members\n` +
-    `• \`!timeout @member [minutes]\` / \`!untimeout @member\`\n` +
     `• \`!servermute @member\` / \`!serverunmute @member\`\n` +
     `• \`!moveall [voice channel]\` : Move voice channel members\n` +
     `• \`!nick [new name]\` / \`!nick reset\` : Set or reset server nickname\n` +
     `• \`!avatar\` + image / \`!avatar reset\` : Set or reset bot avatar\n` +
     `• \`!bio [text]\` / \`!bio reset\` : Set or reset bot About Me bio\n` +
-    `• \`!mimic\` : Interactive server mimic (icon, banner, nickname)\n` +
+    `• \`!mimic\` : Copy this server's icon, banner, description, and name to the bot's server profile\n` +
     `• \`!ping\` / \`!mod\` : Latency and moderation lists\n\n` +
     `**🔥 TROLL & FUN**\n` +
     `• \`!tag @member [count] [message]\` : Repeat a tag\n` +
@@ -704,7 +621,7 @@ async function sendAnimatedHelp(target, guild, clientUser) {
       .setThumbnail(avatarUrl)
       .addFields({
         name: '🔊 VOICE & MUSIC',
-        value: `• \`!join\` / \`!join[num]\` : Join your voice channel (e.g. \`!join25\`)\n• \`!play\` / \`!stop\` : Play recorded audio or stop playback\n• \`!leave\` : Return to the configured voice channel\n• \`!pleave\` : Disconnect from voice\n• \`!700\` / \`!1000\` : Set boosted playback volume`
+      value: `• \`!join\` / \`!join[num]\` : Join your voice channel (e.g. \`!join25\`)\n• \`!play\` / \`!stop\` : Play recorded audio or stop playback\n• \`!playsong <song or URL>\` / \`!ps <song or URL>\` or \`/playsong\` : Play songs through Lavalink\n• \`!leave\` : Return to the configured voice channel\n• \`!pleave\` : Disconnect from voice\n• \`!700\` / \`!1000\` : Set boosted playback volume`
       })
       .setImage('https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExbTNwZHp5bjM4ZHJtODJnbW5oM2pxczZ2NHRwM3U1bThnZGRxOHdybiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/l3q2zVr6cu95nF6O4/giphy.gif');
 
@@ -718,7 +635,7 @@ async function sendAnimatedHelp(target, guild, clientUser) {
     // Build progress frame 2: Add Management & Utility
     const frame2 = EmbedBuilder.from(frame1).addFields({
       name: '🛡️ MANAGEMENT & UTILITY',
-      value: `• \`!wl [add|remove|list] @member\` : Manage this server's whitelist\n• \`!clear [count]\` / \`!clearall\` : Clear messages\n• \`!kick @member\` / \`!ban @member\` : Moderate members\n• \`!timeout @member [minutes]\` / \`!untimeout @member\`\n• \`!servermute @member\` / \`!serverunmute @member\`\n• \`!moveall [voice channel]\` : Move voice channel members\n• \`!nick [new name]\` / \`!nick reset\` : Set or reset server nickname\n• \`!avatar\` + image / \`!avatar reset\` : Set or reset bot avatar\n• \`!bio [text]\` / \`!bio reset\` : Set or reset bot About Me bio\n• \`!mimic\` : Interactive server mimic (icon, banner, nickname)\n• \`!ping\` / \`!mod\` : Latency and moderation lists`
+      value: `• \`!wl [add|remove|list] @member\` : Manage this server's whitelist\n• \`!clear [count]\` / \`!clearall\` : Clear messages\n• \`!servermute @member\` / \`!serverunmute @member\`\n• \`!moveall [voice channel]\` : Move voice channel members\n• \`!nick [new name]\` / \`!nick reset\` : Set or reset server nickname\n• \`!avatar\` + image / \`!avatar reset\` : Set or reset bot avatar\n• \`!bio [text]\` / \`!bio reset\` : Set or reset bot About Me bio\n• \`!mimic\` : Copy this server's icon, banner, description, and name to the bot's server profile\n• \`!ping\` / \`!mod\` : Latency and moderation lists`
     });
 
     if (isSlash) {
@@ -864,6 +781,65 @@ function playGuildAudio(guildId, options = {}) {
   mgr.player.play(resource);
 }
 
+async function restoreRecordedVoiceForGuild(guildId, channelId) {
+  const songHost = songManagersByGuild.get(guildId);
+  if (!songHost) return;
+
+  const player = songHost.client.lavalink?.getPlayer(guildId);
+  if (player) {
+    songHost.switchingToRecorded = true;
+    await player.destroy('Switching to recorded audio').catch(() => {});
+    songHost.switchingToRecorded = false;
+  }
+
+  songHost.restoreVoice(channelId);
+}
+
+async function playSongWithLavalink({ guildId, voiceChannelId, textChannelId, query, requester }) {
+  const songHost = songManagersByGuild.get(guildId);
+  const manager = songHost?.client.lavalink;
+  if (!songHost || !manager) {
+    throw new Error('Song playback is not ready for this server yet.');
+  }
+
+  songHost.releaseVoiceForSong();
+  songHost.bot.guildId = guildId;
+  songHost.bot.channelId = voiceChannelId;
+  let player;
+  try {
+    player = manager.getPlayer(guildId);
+    if (!player) {
+      player = manager.createPlayer({
+        guildId,
+        voiceChannelId,
+        textChannelId,
+        selfDeaf: false,
+        selfMute: false,
+      });
+    } else if (player.voiceChannelId !== voiceChannelId) {
+      await player.changeVoiceState({ voiceChannelId, selfDeaf: false });
+    }
+
+    await player.connect();
+    const result = await player.search(query, requester);
+    if (!result.tracks?.length) {
+      throw new Error('No songs matched that search.');
+    }
+
+    const alreadyPlaying = player.playing;
+    const tracks = result.loadType === 'playlist' ? result.tracks : [result.tracks[0]];
+    player.queue.add(tracks);
+    if (!player.playing) await player.play();
+    return { title: tracks[0].info.title, queuedCount: tracks.length, alreadyPlaying };
+  } catch (err) {
+    songHost.switchingToRecorded = true;
+    if (player) await player.destroy('Song request failed').catch(() => {});
+    songHost.switchingToRecorded = false;
+    songHost.restoreVoice(voiceChannelId);
+    throw err;
+  }
+}
+
 function stopGuildAudio(guildId) {
   const mgr = guildAudioManagers.get(guildId);
   if (mgr) {
@@ -928,9 +904,6 @@ for (const bot of config.bots) {
     ],
   });
 
-  // Register client with proxy manager to auto-rotate proxy on rate limits
-  proxyManager.registerClient(client, currentActiveIndex);
-
   let connection = null;
   let reconnectTimeout = null;
   let connectionTimeout = null;
@@ -939,6 +912,8 @@ for (const bot of config.bots) {
 
   // Main voice channel join logic
   const joinChannel = async (guildId, channelId) => {
+    if (bot._lavalinkOwnsVoice) return;
+
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout);
       reconnectTimeout = null;
@@ -1124,7 +1099,7 @@ for (const bot of config.bots) {
     }, reconnectDelay);
   };
 
-  client.once('ready', async () => {
+  client.once('clientReady', async () => {
     console.log(`${client.user.tag} is online`);
 
     if (!defaultGuildId) {
@@ -1141,7 +1116,6 @@ for (const bot of config.bots) {
           console.log(`[${client.user.tag}] Nickname set to "${bot.nickname || bot.nick}" in ${guild.name}.`);
         }
       } catch (nickErr) {
-        await proxyManager.handleRateLimit(nickErr, 'Startup nickname');
         console.warn(`[${client.user.tag}] Could not set nickname: ${nickErr.message}`);
       }
     }
@@ -1155,7 +1129,6 @@ for (const bot of config.bots) {
           await client.user.setAvatar(avatarBuf);
           console.log(`[${client.user.tag}] Avatar updated from ${avatarFile}.`);
         } catch (avatarErr) {
-          await proxyManager.handleRateLimit(avatarErr, 'Startup avatar');
           console.warn(`[${client.user.tag}] Could not set avatar: ${avatarErr.message}`);
         }
       } else {
@@ -1164,15 +1137,81 @@ for (const bot of config.bots) {
     }
 
     // Add to active bots list
-    activeBots.push({
+    const activeBotEntry = {
       index: currentActiveIndex,
       client: client,
       configuredGuildId: defaultGuildId,
       bot: bot,
       joinChannel: (gid, cid) => joinChannel(gid, cid),
       getConnection: () => connection,
-    });
-    proxyManager.setActiveBots(activeBots);
+      releaseVoiceForSong: () => {
+        bot._lavalinkOwnsVoice = true;
+        intentionalLeave = true;
+        isJoining = false;
+        if (reconnectTimeout) clearTimeout(reconnectTimeout);
+        if (connectionTimeout) clearTimeout(connectionTimeout);
+        reconnectTimeout = null;
+        connectionTimeout = null;
+        if (connection) {
+          connection.removeAllListeners();
+          connection.destroy();
+          connection = null;
+        }
+      },
+      switchingToRecorded: false,
+      restoreVoice: (channelId = bot.channelId || defaultChannelId) => {
+        bot._lavalinkOwnsVoice = false;
+        intentionalLeave = false;
+        bot.guildId = defaultGuildId;
+        bot.channelId = channelId;
+        if (defaultGuildId && channelId) joinChannel(defaultGuildId, channelId);
+      },
+    };
+    activeBots.push(activeBotEntry);
+
+    // One Lavalink manager per server, independent of the recorded-audio player.
+    if (defaultGuildId && !songManagersByGuild.has(defaultGuildId)) {
+      const manager = new LavalinkManager({
+        nodes: [{
+          id: 'nerdx-live-lavalink',
+          host: config.lavalink.host,
+          port: config.lavalink.port,
+          authorization: config.lavalink.password,
+          secure: config.lavalink.secure,
+        }],
+        sendToShard: (guildId, payload) => {
+          const guild = client.guilds.cache.get(guildId);
+          guild?.shard?.send(payload);
+        },
+        autoSkip: true,
+        client: {
+          id: client.user.id,
+          username: client.user.username,
+        },
+        playerOptions: {
+          defaultSearchPlatform: 'ytmsearch',
+          onDisconnect: { autoReconnect: true, destroyPlayer: false },
+          onEmptyQueue: { destroyAfterMs: 30000 },
+        },
+      });
+      client.lavalink = manager;
+      client.on('raw', packet => manager.sendRawData(packet));
+      manager.nodeManager.on('error', (_node, err) => {
+        console.warn(`[Lavalink ${defaultGuildId}] ${err.message}`);
+      });
+      manager.nodeManager.on('connect', node => {
+        console.log(`[Lavalink ${defaultGuildId}] Connected to ${node.id}`);
+      });
+      manager.on('playerDestroy', player => {
+        if (bot._lavalinkOwnsVoice && !activeBotEntry.switchingToRecorded && player.guildId === defaultGuildId) {
+          activeBotEntry.restoreVoice();
+        }
+      });
+      songManagersByGuild.set(defaultGuildId, activeBotEntry);
+      manager.init({ ...client.user }).catch(err => {
+        console.warn(`[Lavalink ${defaultGuildId}] Startup failed: ${err.message}`);
+      });
+    }
 
     // Set bot presence to Playing status
     client.user.setPresence({
@@ -1236,6 +1275,18 @@ for (const bot of config.bots) {
               type: 3, // STRING
               description: 'Song title, artist, or URL to play',
               required: false
+            }
+          ]
+        },
+        {
+          name: 'playsong',
+          description: 'Searches for a song and plays it through Lavalink',
+          options: [
+            {
+              name: 'query',
+              type: 3,
+              description: 'Song title, artist, or direct URL',
+              required: true,
             }
           ]
         },
@@ -1352,156 +1403,6 @@ for (const bot of config.bots) {
         {
           name: 'wllist',
           description: 'Lists all whitelisted members (Admins/Owners only)'
-        },
-        {
-          name: 'nkick',
-          description: 'Kicks a member from the server (Admins/Owners only)',
-          options: [
-            {
-              name: 'member',
-              type: 6, // USER type
-              description: 'The member to kick',
-              required: true
-            },
-            {
-              name: 'reason',
-              type: 3, // STRING type
-              description: 'Reason for the kick',
-              required: false
-            }
-          ]
-        },
-        {
-          name: 'kick',
-          description: 'Kicks a member from the server (Admins/Owners only)',
-          options: [
-            {
-              name: 'member',
-              type: 6,
-              description: 'The member to kick',
-              required: true
-            },
-            {
-              name: 'reason',
-              type: 3,
-              description: 'Reason for the kick',
-              required: false
-            }
-          ]
-        },
-        {
-          name: 'nban',
-          description: 'Bans a member from the server (Admins/Owners only)',
-          options: [
-            {
-              name: 'member',
-              type: 6, // USER type
-              description: 'The member to ban',
-              required: true
-            },
-            {
-              name: 'reason',
-              type: 3, // STRING type
-              description: 'Reason for the ban',
-              required: false
-            },
-            {
-              name: 'delete_messages_days',
-              type: 4, // INTEGER type
-              description: 'Number of days of messages to delete',
-              required: false
-            }
-          ]
-        },
-        {
-          name: 'ban',
-          description: 'Bans a member from the server (Admins/Owners only)',
-          options: [
-            {
-              name: 'member',
-              type: 6,
-              description: 'The member to ban',
-              required: true
-            },
-            {
-              name: 'reason',
-              type: 3,
-              description: 'Reason for the ban',
-              required: false
-            }
-          ]
-        },
-        {
-          name: 'ntimeout',
-          description: 'Times out a member in the server (Admins/Owners only)',
-          options: [
-            {
-              name: 'member',
-              type: 6, // USER type
-              description: 'The member to timeout',
-              required: true
-            },
-            {
-              name: 'duration',
-              type: 4, // INTEGER type
-              description: 'Duration in minutes (default 10)',
-              required: false
-            },
-            {
-              name: 'reason',
-              type: 3, // STRING type
-              description: 'Reason for the timeout',
-              required: false
-            }
-          ]
-        },
-        {
-          name: 'timeout',
-          description: 'Times out a member in the server (Admins/Owners only)',
-          options: [
-            {
-              name: 'member',
-              type: 6,
-              description: 'The member to timeout',
-              required: true
-            },
-            {
-              name: 'duration',
-              type: 4,
-              description: 'Duration in minutes (default 10)',
-              required: false
-            },
-            {
-              name: 'reason',
-              type: 3,
-              description: 'Reason for the timeout',
-              required: false
-            }
-          ]
-        },
-        {
-          name: 'nuntimeout',
-          description: 'Removes the timeout of a member in the server (Admins/Owners only)',
-          options: [
-            {
-              name: 'member',
-              type: 6, // USER type
-              description: 'The member to untimeout',
-              required: true
-            }
-          ]
-        },
-        {
-          name: 'untimeout',
-          description: 'Removes the timeout of a member in the server (Admins/Owners only)',
-          options: [
-            {
-              name: 'member',
-              type: 6,
-              description: 'The member to untimeout',
-              required: true
-            }
-          ]
         },
         {
           name: 'nping',
@@ -1621,7 +1522,7 @@ for (const bot of config.bots) {
         },
         {
           name: 'mimic',
-          description: 'Mimic server icon, banner, or nickname',
+          description: 'Copy server profile fields to this bot’s guild-specific profile',
           options: [
             {
               name: 'option',
@@ -1629,9 +1530,10 @@ for (const bot of config.bots) {
               description: 'Which profile element to mimic',
               required: false,
               choices: [
-                { name: 'All (Icon, Banner, Nick)', value: 'all' },
+                { name: 'All (Icon, Banner, Bio, Nick)', value: 'all' },
                 { name: 'Icon (Avatar)', value: 'avatar' },
                 { name: 'Banner', value: 'banner' },
+                { name: 'Bio (Server Description)', value: 'bio' },
                 { name: 'Nickname', value: 'nick' }
               ]
             }
@@ -1655,6 +1557,7 @@ for (const bot of config.bots) {
 
     // 24/7 Voice Channel Watchdog: Ensure bot remains inside configured VC permanently
     setInterval(() => {
+      if (bot._lavalinkOwnsVoice) return;
       if (intentionalLeave) return;
       const targetGuildId = defaultGuildId || bot.guildId;
       const targetChannelId = defaultChannelId || bot.channelId;
@@ -1689,6 +1592,8 @@ for (const bot of config.bots) {
       return;
     }
 
+    if (bot._lavalinkOwnsVoice) return;
+
     if (!newState.channelId) {
       if (bot._hasConnectedVoice) {
         bot._hasConnectedVoice = false;
@@ -1717,10 +1622,9 @@ for (const bot of config.bots) {
       'tag', 'clear', 'njoin', 'nplay', 'nleave', 'nstop', 'npleave', 'n700', 'n1000', 'ogvc', 'help', 'nhelp', 'whitelist', '1wl',
       'nshuffle', 'nstopshuffle', 'shuffle', 'stopshuffle',
       'wllist',
-      'nkick', 'kick', 'nban', 'ban', 'ntimeout', 'timeout', 'nuntimeout', 'untimeout',
       'nping', 'nmod', 'mod', 'nclearall',
       'servermute', 'nservermute', 'serverunmute', 'nserverunmute', 'moveall', 'nmoveall',
-      'playgame'
+      'playgame', 'bio', 'mimic', 'playsong'
     ];
 
     if (!allSlashCommands.includes(commandName)) return;
@@ -1749,7 +1653,7 @@ for (const bot of config.bots) {
     }
 
     // Allow anyone to use help or playgame
-    if (commandName === 'help' || commandName === 'nhelp' || commandName === 'playgame') {
+    if (commandName === 'help' || commandName === 'nhelp' || commandName === 'playgame' || commandName === 'playsong') {
       isAllowed = true;
     }
 
@@ -1831,6 +1735,33 @@ for (const bot of config.bots) {
       return interaction.reply({ content: 'Joining the voice channel.' });
     }
 
+    else if (commandName === 'playsong') {
+      const voiceChannel = interaction.member?.voice?.channel;
+      if (!voiceChannel) {
+        return interaction.reply({ content: 'Join a voice channel first to play a song.', ephemeral: true });
+      }
+      const query = interaction.options.getString('query', true).trim();
+      if (!query) {
+        return interaction.reply({ content: 'Enter a song title, artist, or URL.', ephemeral: true });
+      }
+
+      await interaction.deferReply();
+      try {
+        const result = await playSongWithLavalink({
+          guildId: interaction.guildId,
+          voiceChannelId: voiceChannel.id,
+          textChannelId: interaction.channelId,
+          query,
+          requester: interaction.user,
+        });
+        const action = result.alreadyPlaying ? 'Queued' : 'Playing';
+        return interaction.editReply(`🎵 ${action}: **${result.title}**${result.queuedCount > 1 ? ` (+${result.queuedCount - 1} playlist tracks)` : ''}`);
+      } catch (err) {
+        console.error(`[Lavalink ${interaction.guildId}] Song request failed: ${err.message}`);
+        return interaction.editReply(`Could not play that song: ${err.message}`);
+      }
+    }
+
     else if (commandName === 'nplay') {
       const vc = interaction.member?.voice?.channel;
       const targetVcId = vc ? vc.id : (bot.channelId || defaultChannelId);
@@ -1838,6 +1769,8 @@ for (const bot of config.bots) {
       if (!targetVcId) {
         return interaction.reply({ content: 'Join a voice channel first to play audio.', ephemeral: true });
       }
+
+      await restoreRecordedVoiceForGuild(interaction.guildId, targetVcId);
 
       // Ensure all bots in this guild join the voice channel
       const guildBots = activeBots.filter(b => b.configuredGuildId === interaction.guildId || b.client?.guilds?.cache?.has(interaction.guildId));
@@ -1850,9 +1783,10 @@ for (const bot of config.bots) {
       }
 
       const mgr = getGuildAudioManager(interaction.guildId);
+      mgr.currentVolume = 10.0;
       playGuildAudio(interaction.guildId, { volume: mgr.currentVolume, bassBoost: mgr.currentBassBoost });
 
-      return interaction.reply({ content: `Playing recorded audio across ${guildBots.length || 1} bot(s) in sync (Volume: ${mgr.currentVolume * 100}%, Bass Boost: ${mgr.currentBassBoost ? 'ON' : 'OFF'}).` });
+      return interaction.reply({ content: `Playing recorded audio across ${guildBots.length || 1} bot(s) in sync (Volume: 1000%, Bass Boost: ${mgr.currentBassBoost ? 'ON' : 'OFF'}).` });
     }
 
     else if (commandName === 'nstop') {
@@ -2025,108 +1959,6 @@ for (const bot of config.bots) {
       return interaction.reply({ content: 'Shuffle loop stopped successfully.' });
     }
 
-    else if (commandName === 'nkick' || commandName === 'kick') {
-      if (!isOwnerOrAdmin(interaction.user.id, interaction.guild?.id)) {
-        return interaction.reply({ content: 'You do not have permission to kick members.', ephemeral: true });
-      }
-
-      const targetMember = interaction.options.getMember('member');
-      if (!targetMember) {
-        return interaction.reply({ content: 'Could not find that member in the server.', ephemeral: true });
-      }
-      const reason = interaction.options.getString('reason') ?? '';
-
-      await promptModerationConfirm(
-        interaction,
-        `Are you sure you want to **kick** ${targetMember.user.tag}?`,
-        interaction.user.id,
-        async (confirmationInteraction) => {
-          const result = await kickMember(interaction.guild, targetMember, interaction.user, reason);
-          if (result.success) {
-            await confirmationInteraction.update({ content: `✅ Successfully kicked ${targetMember.user.tag}.`, embeds: [], components: [] });
-          } else {
-            await confirmationInteraction.update({ content: `❌ Failed to kick member: ${result.error}`, embeds: [], components: [] });
-          }
-        }
-      );
-    }
-
-    else if (commandName === 'nban' || commandName === 'ban') {
-      if (!isOwnerOrAdmin(interaction.user.id, interaction.guild?.id)) {
-        return interaction.reply({ content: 'You do not have permission to ban members.', ephemeral: true });
-      }
-
-      const targetMember = interaction.options.getMember('member');
-      const targetUser = interaction.options.getUser('member');
-      const reason = interaction.options.getString('reason') ?? '';
-
-      await promptModerationConfirm(
-        interaction,
-        `Are you sure you want to **ban** ${targetUser?.tag || 'this member'}?`,
-        interaction.user.id,
-        async (confirmationInteraction) => {
-          const result = await banMember(interaction.guild, targetMember || targetUser, interaction.user, reason);
-          if (result.success) {
-            await confirmationInteraction.update({ content: `✅ Successfully banned ${targetUser?.tag || 'member'}.`, embeds: [], components: [] });
-          } else {
-            await confirmationInteraction.update({ content: `❌ Failed to ban member: ${result.error}`, embeds: [], components: [] });
-          }
-        }
-      );
-    }
-
-    else if (commandName === 'ntimeout' || commandName === 'timeout') {
-      if (!isOwnerOrAdmin(interaction.user.id, interaction.guild?.id)) {
-        return interaction.reply({ content: 'You do not have permission to timeout members.', ephemeral: true });
-      }
-
-      const targetMember = interaction.options.getMember('member');
-      if (!targetMember) {
-        return interaction.reply({ content: 'Could not find that member in the server.', ephemeral: true });
-      }
-      const duration = interaction.options.getInteger('duration') ?? 10;
-      const reason = interaction.options.getString('reason') ?? '';
-
-      await promptModerationConfirm(
-        interaction,
-        `Are you sure you want to **timeout** ${targetMember.user.tag} for ${duration} minutes?`,
-        interaction.user.id,
-        async (confirmationInteraction) => {
-          const result = await timeoutMember(interaction.guild, targetMember, interaction.user, duration, reason);
-          if (result.success) {
-            await confirmationInteraction.update({ content: `✅ Successfully timed out ${targetMember.user.tag} for ${duration} minutes.`, embeds: [], components: [] });
-          } else {
-            await confirmationInteraction.update({ content: `❌ Failed to timeout member: ${result.error}`, embeds: [], components: [] });
-          }
-        }
-      );
-    }
-
-    else if (commandName === 'nuntimeout' || commandName === 'untimeout') {
-      if (!isOwnerOrAdmin(interaction.user.id, interaction.guild?.id)) {
-        return interaction.reply({ content: 'You do not have permission to untimeout members.', ephemeral: true });
-      }
-
-      const targetMember = interaction.options.getMember('member');
-      if (!targetMember) {
-        return interaction.reply({ content: 'Could not find that member in the server.', ephemeral: true });
-      }
-
-      await promptModerationConfirm(
-        interaction,
-        `Are you sure you want to **remove timeout** from ${targetMember.user.tag}?`,
-        interaction.user.id,
-        async (confirmationInteraction) => {
-          const result = await untimeoutMember(interaction.guild, targetMember, interaction.user);
-          if (result.success) {
-            await confirmationInteraction.update({ content: `✅ Successfully removed timeout from ${targetMember.user.tag}.`, embeds: [], components: [] });
-          } else {
-            await confirmationInteraction.update({ content: `❌ Failed to remove timeout from member: ${result.error}`, embeds: [], components: [] });
-          }
-        }
-      );
-    }
-
     else if (commandName === 'nping') {
       const ping = Date.now() - interaction.createdTimestamp;
       const apiPing = Math.round(client.ws.ping);
@@ -2247,7 +2079,6 @@ for (const bot of config.bots) {
         await client.rest.patch(Routes.user(), { body: { bio: newBio } });
         return interaction.reply({ content: newBio ? `✅ Updated **${client.user.tag}** bio to: "${newBio}"` : `✅ Reset **${client.user.tag}** bio.` });
       } catch (err) {
-        if (proxyManager) await proxyManager.handleRateLimit(err, 'Set bio slash');
         return interaction.reply({ content: `❌ Could not update bio: ${err.message}`, ephemeral: true });
       }
     }
@@ -2258,7 +2089,7 @@ for (const bot of config.bots) {
       }
       const opt = interaction.options.getString('option') || 'all';
       await interaction.deferReply();
-      const res = await executeMimic(interaction.guild, client, opt, proxyManager);
+      const res = await executeMimic(interaction.guild, client, opt);
       return interaction.editReply({ content: res });
     }
   });
@@ -2454,7 +2285,6 @@ for (const bot of config.bots) {
           try {
             await message.guild.members.me.setNickname(null);
           } catch (nickErr) {
-            await proxyManager.handleRateLimit(nickErr, 'Reset nickname');
             console.warn(`[${client.user.tag}] setNickname error:`, nickErr.message);
           }
           return message.reply("Reset bot nickname in this server.");
@@ -2467,13 +2297,11 @@ for (const bot of config.bots) {
         try {
           await message.guild.members.me.setNickname(newNick);
         } catch (nickErr) {
-          await proxyManager.handleRateLimit(nickErr, 'Set nickname');
           console.warn(`[${client.user.tag}] setNickname error:`, nickErr.message);
         }
 
         return message.reply(`Updated server nickname to "${newNick}".`);
       } catch (err) {
-        await proxyManager.handleRateLimit(err, 'Nickname command');
         return message.reply(`Could not update server nickname: ${err.message}`);
       }
     }
@@ -2497,17 +2325,19 @@ for (const bot of config.bots) {
           .setColor('#5865F2')
           .setTitle('🎭 Mimic Server Profile')
           .setDescription(
-            `Choose an option below for **${client.user.tag}** to mimic from **${message.guild.name}**:\n\n` +
-            `• 🖼️ **Icon (Avatar)** — Set bot avatar to the server icon\n` +
-            `• 🎨 **Banner** — Set bot profile banner to the server banner\n` +
-            `• 🏷️ **Nickname** — Change bot server nickname to match this server name\n` +
-            `• ✨ **All** — Mimic Icon, Banner, and Nickname together`
+            `Choose which fields to copy from **${message.guild.name}** to this bot's profile in this server:\n\n` +
+            `• 🖼️ **Icon (Avatar)** — Copy the server icon to the bot's server avatar\n` +
+            `• 🎨 **Banner** — Copy the server banner to the bot's server banner\n` +
+            `• 📝 **Bio** — Copy the server description to the bot's server bio\n` +
+            `• 🏷️ **Nickname** — Match the bot's nickname to this server name\n` +
+            `• ✨ **All** — Copy all available fields`
           )
           .setFooter({ text: 'Click an option button below' });
 
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('mimic_btn_icon').setLabel('Icon (Avatar)').setStyle(ButtonStyle.Primary).setEmoji('🖼️'),
           new ButtonBuilder().setCustomId('mimic_btn_banner').setLabel('Banner').setStyle(ButtonStyle.Secondary).setEmoji('🎨'),
+          new ButtonBuilder().setCustomId('mimic_btn_bio').setLabel('Bio').setStyle(ButtonStyle.Secondary).setEmoji('📝'),
           new ButtonBuilder().setCustomId('mimic_btn_nick').setLabel('Nickname').setStyle(ButtonStyle.Success).setEmoji('🏷️'),
           new ButtonBuilder().setCustomId('mimic_btn_all').setLabel('All').setStyle(ButtonStyle.Danger).setEmoji('✨')
         );
@@ -2529,10 +2359,11 @@ for (const bot of config.bots) {
           let choice = 'all';
           if (interaction.customId === 'mimic_btn_icon') choice = 'avatar';
           else if (interaction.customId === 'mimic_btn_banner') choice = 'banner';
+          else if (interaction.customId === 'mimic_btn_bio') choice = 'bio';
           else if (interaction.customId === 'mimic_btn_nick') choice = 'nick';
           else if (interaction.customId === 'mimic_btn_all') choice = 'all';
 
-          const res = await executeMimic(message.guild, client, choice, proxyManager);
+          const res = await executeMimic(message.guild, client, choice);
           try {
             await mimicMsg.edit({ content: res, embeds: [], components: [] });
           } catch {
@@ -2553,11 +2384,11 @@ for (const bot of config.bots) {
         return;
       }
 
-      if (!['all', 'avatar', 'nick', 'banner'].includes(subArg)) {
-        return message.reply('Usage: `!mimic` (interactive menu) or `!mimic [icon|nick|banner|all]`');
+      if (!['all', 'avatar', 'nick', 'banner', 'bio'].includes(subArg)) {
+        return message.reply('Usage: `!mimic` (interactive menu) or `!mimic [icon|nick|banner|bio|all]`');
       }
 
-      const res = await executeMimic(message.guild, client, subArg, proxyManager);
+      const res = await executeMimic(message.guild, client, subArg);
       return message.reply(res);
     }
 
@@ -2597,7 +2428,6 @@ for (const bot of config.bots) {
         });
         return message.reply(newBio ? `✅ Updated **${client.user.tag}** bio to: "${newBio}"` : `✅ Reset **${client.user.tag}** bio.`);
       } catch (err) {
-        if (proxyManager) await proxyManager.handleRateLimit(err, 'Set bio');
         console.warn(`[${client.user.tag}] set bio error:`, err.message);
         return message.reply(`❌ Could not update bio: ${err.message}`);
       }
@@ -2624,7 +2454,6 @@ for (const bot of config.bots) {
             await client.user.setAvatar(null);
             return message.reply("Reset bot avatar.");
           } catch (err) {
-            await proxyManager.handleRateLimit(err, 'Reset avatar');
             return message.reply(`Could not reset avatar: ${err.message}`);
           }
         }
@@ -2654,43 +2483,12 @@ for (const bot of config.bots) {
           await client.user.setAvatar(imageBytes);
           return message.reply("Updated bot avatar.");
         } catch (avatarErr) {
-          if (/fast|rate limit|429/i.test(avatarErr.message || '')) {
-            await proxyManager.rotateProxy('Discord avatar 429 rate limit');
-            return message.reply('Discord rate-limited avatar changes; automatically rotated proxy. Please wait a few moments before trying again.');
-          }
           throw avatarErr;
         }
       } catch (err) {
-        await proxyManager.handleRateLimit(err, 'Avatar command');
         console.error('Failed to update avatar:', err.message);
         return message.reply(`Could not update avatar: ${err.message}`);
       }
-    }
-
-    // !nproxy or !proxy
-    if (commandNameText === '!nproxy' || commandNameText === '!proxy') {
-      if (!isOwnerOrAdmin(message.author.id, message.guild.id, message.member, message.guild)) {
-        if (!isPrimaryInGuild) return;
-        return message.reply('You do not have permission to view proxy details.');
-      }
-
-      if (!isPrimaryInGuild) return;
-
-      const subCommand = args[1]?.toLowerCase();
-      if (subCommand === 'rotate' || subCommand === 'switch') {
-        await proxyManager.rotateProxy('Manual owner rotation');
-        const current = proxyManager.maskProxy(proxyManager.currentProxyUrl);
-        return message.reply(`🔄 Rotated proxy to: \`${current}\` (Total pool: ${proxyManager.proxies.length})`);
-      }
-
-      if (subCommand === 'reload') {
-        const count = proxyManager.loadConfiguredProxies();
-        return message.reply(`🔄 Reloaded proxies. Total pool size: \`${count}\`.`);
-      }
-
-      const current = proxyManager.maskProxy(proxyManager.currentProxyUrl);
-      const poolCount = proxyManager.proxies.length;
-      return message.reply(`🌐 **Proxy Status:**\n• Active Proxy: \`${current}\`\n• Proxy Pool Size: \`${poolCount}\`\n• Auto-rotate on 429 Rate Limit: \`Enabled\`\n• Use \`!nproxy rotate\` to manually cycle proxy, or \`!nproxy reload\` to refresh from file.`);
     }
 
     const normalizedContent = normalizePrefixCommand(message.content);
@@ -2706,14 +2504,38 @@ for (const bot of config.bots) {
       return sendAnimatedHelp(message, message.guild, client.user);
     }
 
+    const playSongMatch = message.content.trim().match(/^!?\s*(?:playsong|ps)(?:\s+([\s\S]+))?$/i);
+    if (playSongMatch) {
+      if (!isPrimaryInGuild) return;
+      const query = playSongMatch[1]?.trim();
+      if (!query) {
+        return message.reply('Usage: `!playsong <song or URL>` (alias: `!ps <song or URL>`)');
+      }
+      const voiceChannel = message.member?.voice?.channel;
+      if (!voiceChannel) {
+        return message.reply('Join a voice channel first to play a song.');
+      }
+
+      try {
+        const result = await playSongWithLavalink({
+          guildId: message.guild.id,
+          voiceChannelId: voiceChannel.id,
+          textChannelId: message.channel.id,
+          query,
+          requester: message.author,
+        });
+        const action = result.alreadyPlaying ? 'Queued' : 'Playing';
+        return message.reply(`🎵 ${action}: **${result.title}**${result.queuedCount > 1 ? ` (+${result.queuedCount - 1} playlist tracks)` : ''}`);
+      } catch (err) {
+        console.error(`[Lavalink ${message.guild.id}] Song request failed: ${err.message}`);
+        return message.reply(`Could not play that song: ${err.message}`);
+      }
+    }
+
     const isTagCommand = contentLower.startsWith('!ntag');
     const isClearCommand = contentLower === '!nclear' || contentLower.startsWith('!nclear ');
     const isShuffleCommand = contentLower.startsWith('!nshuffle') || contentLower.startsWith('!shuffle') || contentLower.startsWith('shuffle') || contentLower.startsWith('nshuffle');
     const isStopShuffleCommand = contentLower.startsWith('!nstopshuffle') || contentLower.startsWith('!stopshuffle') || contentLower.startsWith('stopshuffle') || contentLower === 'stop shuffle' || contentLower === '!stop shuffle' || contentLower === 'nstop shuffle' || contentLower === '!nstop shuffle';
-    const isKickCommand = contentLower.startsWith('!nkick') || contentLower.startsWith('!kick');
-    const isBanCommand = contentLower.startsWith('!nban') || contentLower.startsWith('!ban');
-    const isTimeoutCommand = contentLower.startsWith('!ntimeout') || contentLower.startsWith('!timeout') || contentLower.startsWith('!nmute') || contentLower.startsWith('!mute');
-    const isUntimeoutCommand = contentLower.startsWith('!nuntimeout') || contentLower.startsWith('!untimeout') || contentLower.startsWith('!nunmute') || contentLower.startsWith('!unmute');
     const isServerMuteCommand = contentLower.startsWith('!nservermute') || contentLower.startsWith('!servermute') || contentLower.startsWith('!nsmute') || contentLower.startsWith('!smute');
     const isServerUnmuteCommand = contentLower.startsWith('!nserverunmute') || contentLower.startsWith('!serverunmute') || contentLower.startsWith('!nsunmute') || contentLower.startsWith('!sunmute');
     const isMoveAllCommand = contentLower.startsWith('!nmoveall') || contentLower.startsWith('!moveall');
@@ -2726,8 +2548,8 @@ for (const bot of config.bots) {
       contentLower === '!play' || contentLower.startsWith('!play ') ||
       contentLower === 'play' || contentLower.startsWith('play ') ||
       contentLower === 'nplay' || contentLower.startsWith('nplay ');
-    const allowedCommands = ['!njoin', '!nplay', '!nleave', '!nstop', '!npleave', '!n700', '!n1000', '!ogvc', '!nproxy', '!proxy'];
-    if (allowedCommands.includes(contentLower) || isPlayCommand || isTagCommand || isClearCommand || isShuffleCommand || isStopShuffleCommand || isKickCommand || isBanCommand || isTimeoutCommand || isUntimeoutCommand || isPingCommand || isModCommand || isSingleJoinCommand || isClearAllCommand || isServerMuteCommand || isServerUnmuteCommand || isMoveAllCommand) {
+    const allowedCommands = ['!njoin', '!nplay', '!nleave', '!nstop', '!npleave', '!n700', '!n1000', '!ogvc'];
+    if (allowedCommands.includes(contentLower) || isPlayCommand || isTagCommand || isClearCommand || isShuffleCommand || isStopShuffleCommand || isPingCommand || isModCommand || isSingleJoinCommand || isClearAllCommand || isServerMuteCommand || isServerUnmuteCommand || isMoveAllCommand) {
       let isAllowed = false;
 
       // Owner (allowed on all bots, all servers)
@@ -2997,6 +2819,10 @@ for (const bot of config.bots) {
         return;
       }
 
+      if (isPrimaryInGuild) {
+        await restoreRecordedVoiceForGuild(message.guild.id, targetVcId);
+      }
+
       // Normal play command: ALL bots in this guild join VC if not already connected
       if (!connection || bot.channelId !== targetVcId) {
         bot.guildId = message.guild.id;
@@ -3008,8 +2834,9 @@ for (const bot of config.bots) {
       // The primary responder triggers shared playback ONCE for all bots in this guild
       if (isPrimaryInGuild) {
         const mgr = getGuildAudioManager(message.guild.id);
+        mgr.currentVolume = 10.0;
         playGuildAudio(message.guild.id, { volume: mgr.currentVolume, bassBoost: mgr.currentBassBoost });
-        return message.reply(`Playing recorded audio across bots in sync (Volume: ${mgr.currentVolume * 100}%, Bass Boost: ${mgr.currentBassBoost ? 'ON' : 'OFF'}).`);
+        return message.reply(`Playing recorded audio across bots in sync (Volume: 1000%, Bass Boost: ${mgr.currentBassBoost ? 'ON' : 'OFF'}).`);
       }
       return;
     }
@@ -3094,155 +2921,6 @@ for (const bot of config.bots) {
         return message.reply('Volume boosted to 1000%, Bass Boost set to MAX, and VC muted to dominate.');
       }
       return;
-    }
-
-    // !kick
-    if (isKickCommand) {
-      if (message.guild) {
-        const botsInGuild = activeBots.filter(b => b.configuredGuildId === message.guild.id);
-        if (botsInGuild.length > 1) {
-          botsInGuild.sort((a, b) => a.index - b.index);
-          const masterBot = botsInGuild[0];
-          if (masterBot.index !== currentActiveIndex) {
-            return;
-          }
-        }
-      }
-
-      const targetMember = message.mentions.members.first();
-      if (!targetMember) {
-        return message.reply('Please mention a member to kick. Example: `!kick @member [reason]`');
-      }
-
-      const args = message.content.trim().split(/\s+/);
-      const reason = args.slice(2).join(' ');
-
-      await promptModerationConfirm(
-        message,
-        `Are you sure you want to **kick** ${targetMember.user.tag}?`,
-        message.author.id,
-        async (confirmationInteraction) => {
-          const result = await kickMember(message.guild, targetMember, message.author, reason);
-          if (result.success) {
-            await confirmationInteraction.update({ content: `✅ Successfully kicked ${targetMember.user.tag}.`, embeds: [], components: [] });
-          } else {
-            await confirmationInteraction.update({ content: `❌ Failed to kick member: ${result.error}`, embeds: [], components: [] });
-          }
-        }
-      );
-    }
-
-    // !ban
-    if (isBanCommand) {
-      if (message.guild) {
-        const botsInGuild = activeBots.filter(b => b.configuredGuildId === message.guild.id);
-        if (botsInGuild.length > 1) {
-          botsInGuild.sort((a, b) => a.index - b.index);
-          const masterBot = botsInGuild[0];
-          if (masterBot.index !== currentActiveIndex) {
-            return;
-          }
-        }
-      }
-
-      const targetMember = message.mentions.members.first() || message.guild.members.cache.get(message.content.split(/\s+/)[1]);
-      if (!targetMember) {
-        return message.reply('Please mention a member or specify a user ID to ban. Example: `!ban @member [reason]`');
-      }
-
-      const args = message.content.trim().split(/\s+/);
-      const reason = args.slice(2).join(' ');
-
-      await promptModerationConfirm(
-        message,
-        `Are you sure you want to **ban** ${targetMember?.user?.tag || targetMember?.id || 'this member'}?`,
-        message.author.id,
-        async (confirmationInteraction) => {
-          const result = await banMember(message.guild, targetMember, message.author, reason);
-          if (result.success) {
-            await confirmationInteraction.update({ content: `✅ Successfully banned ${targetMember?.user?.tag || targetMember?.id || 'member'}.`, embeds: [], components: [] });
-          } else {
-            await confirmationInteraction.update({ content: `❌ Failed to ban member: ${result.error}`, embeds: [], components: [] });
-          }
-        }
-      );
-    }
-
-    // !timeout / !mute
-    if (isTimeoutCommand) {
-      if (message.guild) {
-        const botsInGuild = activeBots.filter(b => b.configuredGuildId === message.guild.id);
-        if (botsInGuild.length > 1) {
-          botsInGuild.sort((a, b) => a.index - b.index);
-          const masterBot = botsInGuild[0];
-          if (masterBot.index !== currentActiveIndex) {
-            return;
-          }
-        }
-      }
-
-      const targetMember = message.mentions.members.first();
-      if (!targetMember) {
-        return message.reply('Please mention a member to timeout. Example: `!timeout @member [duration_in_minutes] [reason]`');
-      }
-
-      const args = message.content.trim().split(/\s+/);
-      let duration = 10;
-      let reasonIndex = 2;
-
-      if (args[2] && /^\d+$/.test(args[2])) {
-        duration = parseInt(args[2], 10);
-        reasonIndex = 3;
-      }
-
-      const reason = args.slice(reasonIndex).join(' ');
-
-      await promptModerationConfirm(
-        message,
-        `Are you sure you want to **timeout** ${targetMember.user.tag} for ${duration} minutes?`,
-        message.author.id,
-        async (confirmationInteraction) => {
-          const result = await timeoutMember(message.guild, targetMember, message.author, duration, reason);
-          if (result.success) {
-            await confirmationInteraction.update({ content: `✅ Successfully timed out ${targetMember.user.tag} for ${duration} minutes.`, embeds: [], components: [] });
-          } else {
-            await confirmationInteraction.update({ content: `❌ Failed to timeout member: ${result.error}`, embeds: [], components: [] });
-          }
-        }
-      );
-    }
-
-    // !untimeout / !unmute
-    if (isUntimeoutCommand) {
-      if (message.guild) {
-        const botsInGuild = activeBots.filter(b => b.configuredGuildId === message.guild.id);
-        if (botsInGuild.length > 1) {
-          botsInGuild.sort((a, b) => a.index - b.index);
-          const masterBot = botsInGuild[0];
-          if (masterBot.index !== currentActiveIndex) {
-            return;
-          }
-        }
-      }
-
-      const targetMember = message.mentions.members.first();
-      if (!targetMember) {
-        return message.reply('Please mention a member to remove timeout from. Example: `!untimeout @member`');
-      }
-
-      await promptModerationConfirm(
-        message,
-        `Are you sure you want to **remove timeout** from ${targetMember.user.tag}?`,
-        message.author.id,
-        async (confirmationInteraction) => {
-          const result = await untimeoutMember(message.guild, targetMember, message.author);
-          if (result.success) {
-            await confirmationInteraction.update({ content: `✅ Successfully removed timeout from ${targetMember.user.tag}.`, embeds: [], components: [] });
-          } else {
-            await confirmationInteraction.update({ content: `❌ Failed to remove timeout from member: ${result.error}`, embeds: [], components: [] });
-          }
-        }
-      );
     }
 
     // !nping
